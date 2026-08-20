@@ -763,7 +763,7 @@ def render_cards_block(scenario: str) -> None:
             skey(scenario, "black_ltv"),
             min_value=0.0, max_value=10_000_000.0,
             decimals=0,
-            help="База 12 000 ₽ (оценочно, lifetime в месяц заявки).",
+            help="База 3 000 ₽ (оценочно, lifetime в месяц заявки).",
         )
     with right:
         st.markdown("**Platinum**")
