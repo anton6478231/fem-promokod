@@ -16,7 +16,13 @@ export default {
   "paid_partner_share_pct": 100.0,
   "arpu": 150.0,
   "contractor_share_pct": 30.0,
+  "contractor_share_rnd": 30.0,
+  "contractor_share_ops": 0.0,
+  "contractor_share_status_quo": 30.0,
   "dev_cost_month": 1800000,
+  "dev_cost_rnd": 1800000,
+  "dev_cost_ops": 0,
+  "dev_cost_status_quo": 0,
   "card_black_enabled": true,
   "black_share_pct": 0.0,
   "black_ltv": 3000.0,
@@ -65,20 +71,23 @@ export default {
     {
       "name": "Хостинг и CDN",
       "kind": "fixed",
-      "value": 40000,
-      "phase": "own"
+      "rnd": 0,
+      "ops": 40000,
+      "status_quo": 0
     },
     {
       "name": "SEO / контент",
       "kind": "fixed",
-      "value": 30000,
-      "phase": "own"
+      "rnd": 0,
+      "ops": 30000,
+      "status_quo": 0
     },
     {
       "name": "Атрибуция / антифрод",
       "kind": "per_paid_activation",
-      "value": 8,
-      "phase": "own"
+      "rnd": 0,
+      "ops": 8,
+      "status_quo": 0
     }
   ]
 };

@@ -1,9 +1,11 @@
-import { applyBaseConstraints, runModel, sensitivityTable } from "./engine.js";
+import { applyBaseConstraints, runModel, sensitivityTable } from "./engine.js?v=20260820-tooltip";
 
 const ORGANIC_COPY_KEYS = [
   "rnd_months", "traffic_month", "seo_dip_enabled", "seo_dip_floor_pct", "seo_recovery_months",
   "conversion_pct", "approved_activation_share_pct", "paid_partner_share_pct", "arpu",
-  "contractor_share_pct", "dev_cost_month", "card_black_enabled", "black_share_pct", "black_ltv",
+  "contractor_share_pct", "contractor_share_rnd", "contractor_share_ops", "contractor_share_status_quo",
+  "dev_cost_month", "dev_cost_rnd", "dev_cost_ops", "dev_cost_status_quo",
+  "card_black_enabled", "black_share_pct", "black_ltv",
   "card_platinum_enabled", "platinum_share_pct", "platinum_ltv", "support_rnd", "support_ops",
   "support_status_quo", "salaries_status_quo",
 ];
@@ -21,12 +23,12 @@ const KIND_OPTIONS = [
   ["per_activation", "₽ за активацию"],
   ["pct_of_revenue", "% от выручки"],
 ];
-const PHASE_OPTIONS = [
-  ["own", "свой сайт"],
-  ["rnd", "RnD"],
-  ["both", "обе фазы"],
-  ["status_quo", "статус-кво"],
-];
+const KIND_UNITS = {
+  fixed: "₽/мес",
+  per_paid_activation: "₽ / оплаченную",
+  per_activation: "₽ / активацию",
+  pct_of_revenue: "% от выручки",
+};
 
 const KEEP_ZERO = new Set([
   "Выручка (валовая)", "Доля подрядчика", "Разработка сайта", "Поддержка", "Итого затраты", "CF месяца",
@@ -88,9 +90,36 @@ function stripMeta(src) {
   return next;
 }
 
+function normalizeVariableCost(row) {
+  const next = { ...row, kind: row.kind || "fixed", name: row.name || "" };
+  if (next.rnd != null || next.ops != null || next.status_quo != null) {
+    next.rnd = Number(next.rnd || 0);
+    next.ops = Number(next.ops || 0);
+    next.status_quo = Number(next.status_quo || 0);
+    return next;
+  }
+  const value = Number(next.value || 0);
+  const phase = String(next.phase || "own");
+  next.rnd = phase === "rnd" || phase === "both" ? value : 0;
+  next.ops = phase === "own" || phase === "both" ? value : 0;
+  next.status_quo = phase === "status_quo" || phase === "rnd" || phase === "both" ? value : 0;
+  return next;
+}
+
+function normalizeScenario(p) {
+  if (p.contractor_share_rnd == null) p.contractor_share_rnd = p.contractor_share_pct ?? 0;
+  if (p.contractor_share_ops == null) p.contractor_share_ops = 0;
+  if (p.contractor_share_status_quo == null) p.contractor_share_status_quo = p.contractor_share_pct ?? 0;
+  if (p.dev_cost_rnd == null) p.dev_cost_rnd = p.dev_cost_month ?? 0;
+  if (p.dev_cost_ops == null) p.dev_cost_ops = 0;
+  if (p.dev_cost_status_quo == null) p.dev_cost_status_quo = 0;
+  p.variable_costs = (p.variable_costs || []).map(normalizeVariableCost);
+  return p;
+}
+
 function initState(src) {
-  const base = stripMeta(src);
-  const stretch = stripMeta(src);
+  const base = normalizeScenario(stripMeta(src));
+  const stretch = normalizeScenario(stripMeta(src));
   return {
     tab: (location.hash.replace("#", "") || "base"),
     num_months: src.num_months,
@@ -107,6 +136,23 @@ function field(sc, key, label, opts = {}) {
   }
   const step = opts.step ?? 1;
   return `<label class="field">${label}<input type="${type}" autocomplete="off" data-sc="${sc}" data-key="${key}" value="${value ?? 0}" step="${step}"></label>`;
+}
+
+function costPhaseRow(sc, title, rndKey, opsKey, sqKey, opts = {}) {
+  return `<div class="cost-card">
+    <h3>${title}</h3>
+    <div class="row3">
+      ${field(sc, rndKey, "RnD", opts)}
+      ${field(sc, opsKey, "Свой сайт", opts)}
+      ${field(sc, sqKey, "Статус-кво", opts)}
+    </div>
+  </div>`;
+}
+
+function arrField(sc, arr, i, key, label, opts = {}) {
+  const value = state[sc][arr][i][key] ?? 0;
+  const step = opts.step ?? 1;
+  return `<label class="field">${label}<input type="number" autocomplete="off" data-sc="${sc}" data-arr="${arr}" data-i="${i}" data-k="${key}" value="${value}" step="${step}"></label>`;
 }
 
 function formBlocks(sc, { full = false } = {}) {
@@ -160,7 +206,6 @@ function formBlocks(sc, { full = false } = {}) {
       <h3>Горизонт и разработка</h3>
       ${field(sc, "num_months", "Горизонт, мес.")}
       ${field(sc, "rnd_months", "Разработка сайта, мес.")}
-      ${field(sc, "dev_cost_month", "Стоимость разработки, ₽/мес")}
     </div>
     <div class="block">
       <h3>Органика</h3>
@@ -169,7 +214,6 @@ function formBlocks(sc, { full = false } = {}) {
       ${field(sc, "approved_activation_share_pct", "Доля одобренных, %", { step: 0.1 })}
       ${field(sc, "paid_partner_share_pct", "Доля оплачиваемых, %", { step: 0.1 })}
       ${field(sc, "arpu", "ARPU, ₽")}
-      ${field(sc, "contractor_share_pct", "Доля подрядчика, %")}
     </div>
     <div class="block">
       <h3>SEO-просадка</h3>
@@ -195,16 +239,15 @@ function formBlocks(sc, { full = false } = {}) {
     </div>
     ${rnd}
     <div class="block">
-      <h3>Поддержка, ₽/мес</h3>
-      <div class="row3">
-        ${field(sc, "support_rnd", "RnD")}
-        ${field(sc, "support_ops", "Свой сайт")}
-        ${field(sc, "support_status_quo", "Статус-кво")}
-      </div>
+      <h3>Затраты по фазам</h3>
+      <p class="hint">Как у поддержки: RnD / свой сайт / статус-кво. Статьи ниже можно менять и добавлять.</p>
+      ${costPhaseRow(sc, "Доля подрядчика, %", "contractor_share_rnd", "contractor_share_ops", "contractor_share_status_quo", { step: 0.1 })}
+      ${costPhaseRow(sc, "Разработка сайта, ₽/мес", "dev_cost_rnd", "dev_cost_ops", "dev_cost_status_quo")}
+      ${costPhaseRow(sc, "Поддержка, ₽/мес", "support_rnd", "support_ops", "support_status_quo")}
       ${field(sc, "salaries_status_quo", "ЗП статус-кво, ₽/мес")}
     </div>
     <div class="block">
-      <h3>Переменные расходы</h3>
+      <h3>Статьи затрат</h3>
       ${vcEditor(sc)}
     </div>
     ${stretch && !full ? "" : ""}
@@ -240,31 +283,28 @@ function rndEditor(sc) {
 
 function vcEditor(sc) {
   const rows = state[sc].variable_costs || [];
-  const body = rows.map((row, idx) => `
-    <tr>
-      <td><input data-sc="${sc}" data-arr="variable_costs" data-i="${idx}" data-k="name" value="${escapeAttr(row.name || "")}"></td>
-      <td>
+  const blocks = rows.map((row, idx) => {
+    const unit = KIND_UNITS[row.kind] || "₽/мес";
+    return `
+    <div class="cost-card">
+      <div class="cost-card-head">
+        <input class="cost-title" data-sc="${sc}" data-arr="variable_costs" data-i="${idx}" data-k="name" value="${escapeAttr(row.name || "")}" placeholder="Название статьи">
         <select data-sc="${sc}" data-arr="variable_costs" data-i="${idx}" data-k="kind">
           ${KIND_OPTIONS.map(([v, l]) => `<option value="${v}" ${row.kind === v ? "selected" : ""}>${l}</option>`).join("")}
         </select>
-      </td>
-      <td><input type="number" data-sc="${sc}" data-arr="variable_costs" data-i="${idx}" data-k="value" value="${row.value || 0}"></td>
-      <td>
-        <select data-sc="${sc}" data-arr="variable_costs" data-i="${idx}" data-k="phase">
-          ${PHASE_OPTIONS.map(([v, l]) => `<option value="${v}" ${row.phase === v ? "selected" : ""}>${l}</option>`).join("")}
-        </select>
-      </td>
-      <td><button class="icon-btn" data-del="variable_costs" data-sc="${sc}" data-i="${idx}">×</button></td>
-    </tr>
-  `).join("");
+        <button class="icon-btn" data-del="variable_costs" data-sc="${sc}" data-i="${idx}" type="button">×</button>
+      </div>
+      <p class="caption">Значение, ${unit}</p>
+      <div class="row3">
+        ${arrField(sc, "variable_costs", idx, "rnd", "RnD", { step: row.kind === "pct_of_revenue" ? 0.1 : 1 })}
+        ${arrField(sc, "variable_costs", idx, "ops", "Свой сайт", { step: row.kind === "pct_of_revenue" ? 0.1 : 1 })}
+        ${arrField(sc, "variable_costs", idx, "status_quo", "Статус-кво", { step: row.kind === "pct_of_revenue" ? 0.1 : 1 })}
+      </div>
+    </div>`;
+  }).join("");
   return `
-    <div class="editor table-wrap">
-      <table>
-        <thead><tr><th>Статья</th><th>Тип</th><th>Значение</th><th>Фаза</th><th></th></tr></thead>
-        <tbody>${body}</tbody>
-      </table>
-    </div>
-    <button class="ghost" data-add="variable_costs" data-sc="${sc}" type="button">+ статья</button>
+    ${blocks || `<p class="caption">Статей пока нет — добавьте хостинг, SEO или свою строку.</p>`}
+    <button class="ghost" data-add="variable_costs" data-sc="${sc}" type="button">+ статья затрат</button>
   `;
 }
 
@@ -324,7 +364,9 @@ function renderTypical(kpis, scenario) {
     <div class="phase-grid">${blocks.map(([row, title]) => {
       if (!row) return `<div class="phase"><h4>${title}</h4><p class="caption">Нет месяцев этой фазы.</p></div>`;
       const seo = (row.seo_factor || 1) * 100;
-      const extra = Object.entries(row.variable_breakdown || {}).map(([n, v]) => `<li>${n}: ${rub(v)}</li>`).join("");
+      const extra = Object.entries(row.variable_breakdown || {})
+        .filter(([, v]) => Math.abs(v) >= 0.5)
+        .map(([n, v]) => `<li>${n}: ${rub(v)}</li>`).join("");
       const stretchBits = scenario === "stretch"
         ? `<li>промо реклама: ${rub(row.ads_promo_revenue || 0)}</li>
            <li>ЗП сопровождения: ${rub(row.ops_salaries || 0)}</li>
@@ -393,7 +435,7 @@ function monthLabels(project) {
   return project.map((r) => `М${r.month} ${r.phase === "rnd" ? "RnD" : "свой"}`);
 }
 
-function svgChart({ title, labels, series, stacked = false, yFormat = rub }) {
+function svgChart({ title, labels, series, stacked = false, yFormat = rub, yKind = "money" }) {
   const w = 900;
   const h = 340;
   const pad = { l: 78, r: 18, t: 36, b: 46 };
@@ -423,7 +465,7 @@ function svgChart({ title, labels, series, stacked = false, yFormat = rub }) {
         const v = ser.values[i] || 0;
         const y1 = y(acc + v);
         const y0 = y(acc);
-        body += `<rect x="${x(i) - bw / 2}" y="${Math.min(y0, y1)}" width="${bw}" height="${Math.max(1, Math.abs(y0 - y1))}" fill="${ser.color}"><title>${ser.name}: ${yFormat(v)}</title></rect>`;
+        body += `<rect x="${x(i) - bw / 2}" y="${Math.min(y0, y1)}" width="${bw}" height="${Math.max(1, Math.abs(y0 - y1))}" fill="${ser.color}"></rect>`;
         acc += v;
       }
     }
@@ -431,7 +473,7 @@ function svgChart({ title, labels, series, stacked = false, yFormat = rub }) {
     for (const ser of series) {
       const d = ser.values.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
       body += `<path d="${d}" fill="none" stroke="${ser.color}" stroke-width="${ser.width || 2}" stroke-dasharray="${ser.dash || ""}"></path>`;
-      body += ser.values.map((v, i) => `<circle cx="${x(i)}" cy="${y(v)}" r="3" fill="${ser.color}"><title>${labels[i]} · ${ser.name}: ${yFormat(v)}</title></circle>`).join("");
+      body += ser.values.map((v, i) => `<circle cx="${x(i)}" cy="${y(v)}" r="3" fill="${ser.color}"></circle>`).join("");
     }
   }
   const ticks = 4;
@@ -448,30 +490,32 @@ function svgChart({ title, labels, series, stacked = false, yFormat = rub }) {
   const legend = series.map((s, i) => `<g transform="translate(${pad.l + i * 160}, 16)">
     <rect width="10" height="10" fill="${s.color}"></rect>
     <text x="14" y="10" font-size="11" fill="#374151">${s.name}</text></g>`).join("");
-  return `<div class="panel card-pad"><h2>${title}</h2><div class="chart">
+  const hover = `<g class="chart-hover" opacity="0" pointer-events="none">
+      <rect class="chart-hover-band" x="0" y="${pad.t}" width="0" height="${ih}" fill="rgba(17,24,39,.06)"></rect>
+      <line class="chart-hover-line" y1="${pad.t}" y2="${pad.t + ih}" stroke="#111827" stroke-width="1.25" stroke-dasharray="3 3"></line>
+      ${series.map((s, si) => `<circle class="chart-hover-dot" data-si="${si}" r="5" fill="${s.color}" stroke="#fff" stroke-width="2"></circle>`).join("")}
+    </g>
+    <rect class="chart-hit" x="${pad.l}" y="${pad.t}" width="${iw}" height="${ih}" fill="transparent"></rect>`;
+  const payload = {
+    labels, stacked, yKind, w, h, min, max, n, pad,
+    series: series.map((s) => ({ name: s.name, color: s.color, values: s.values })),
+  };
+  return `<div class="panel card-pad"><h2>${title}</h2><div class="chart" data-chart="${escapeAttr(JSON.stringify(payload))}">
     <svg viewBox="0 0 ${w} ${h}" role="img">
       ${band}${grid}<line x1="${pad.l}" x2="${w - pad.r}" y1="${zero}" y2="${zero}" stroke="#9ca3af" stroke-dasharray="3 3"></line>
-      ${body}${xticks}${legend}
-    </svg></div></div>`;
+      ${body}${xticks}${legend}${hover}
+    </svg>
+    <div class="chart-tooltip" hidden></div>
+  </div></div>`;
 }
 
-function renderCharts(project, scenario, payback) {
+function renderCashFlowChart(project) {
   const labels = monthLabels(project);
-  const money = (v) => compact(v);
-  const visits = (v) => nf.format(Math.round(v));
-  const seo = svgChart({
-    title: "Органический трафик: SEO-просадка после переезда",
-    labels,
-    yFormat: visits,
-    series: [
-      { name: "Статус-кво", color: "#9CA3AF", dash: "4 4", values: project.map((r) => r.sq_organic_traffic) },
-      { name: "Проект", color: "#059669", width: 3, values: project.map((r) => r.organic_traffic) },
-    ],
-  });
-  const cf = svgChart({
+  return svgChart({
     title: "Выручка, затраты и денежный поток",
     labels,
-    yFormat: money,
+    yFormat: compact,
+    yKind: "money",
     series: [
       { name: "Выручка", color: "#10B981", width: 3, values: project.map((r) => r.gross_revenue) },
       { name: "Затраты", color: "#EF4444", width: 3, values: project.map((r) => r.total_costs) },
@@ -479,10 +523,27 @@ function renderCharts(project, scenario, payback) {
       { name: "Накопленный CF", color: "#8B5CF6", dash: "6 4", values: project.map((r) => r.cumulative_cf) },
     ],
   });
+}
+
+function renderOtherCharts(project, scenario, payback) {
+  const labels = monthLabels(project);
+  const money = (v) => compact(v);
+  const visits = (v) => nf.format(Math.round(v));
+  const seo = svgChart({
+    title: "Органический трафик: SEO-просадка после переезда",
+    labels,
+    yFormat: visits,
+    yKind: "count",
+    series: [
+      { name: "Статус-кво", color: "#9CA3AF", dash: "4 4", values: project.map((r) => r.sq_organic_traffic) },
+      { name: "Проект", color: "#059669", width: 3, values: project.map((r) => r.organic_traffic) },
+    ],
+  });
   const inc = svgChart({
     title: `Проект vs подрядчик${payback ? ` · окупаемость М${payback}` : ""}`,
     labels,
     yFormat: money,
+    yKind: "money",
     series: [
       { name: "CF проекта", color: "#3B82F6", width: 3, values: project.map((r) => r.cash_flow) },
       { name: "CF статус-кво", color: "#9CA3AF", dash: "4 4", values: project.map((r) => r.sq_cash_flow) },
@@ -494,6 +555,7 @@ function renderCharts(project, scenario, payback) {
     labels,
     stacked: true,
     yFormat: money,
+    yKind: "money",
     series: [
       { name: "ЗП сопровождения", color: "#EF4444", values: project.map((r) => r.ops_salaries || 0) },
       { name: "ЗП доп. RnD", color: "#BE123C", values: project.map((r) => r.extra_rnd_salaries || 0) },
@@ -510,6 +572,7 @@ function renderCharts(project, scenario, payback) {
         labels,
         stacked: true,
         yFormat: money,
+        yKind: "money",
         series: [
           { name: "Промо органика", color: "#059669", values: project.map((r) => r.organic_promo_revenue || 0) },
           { name: "Промо реклама", color: "#2563EB", values: project.map((r) => r.ads_promo_revenue || 0) },
@@ -518,7 +581,7 @@ function renderCharts(project, scenario, payback) {
         ],
       })
     : "";
-  return seo + cf + inc + channel + costs;
+  return seo + inc + channel + costs;
 }
 
 function renderSensitivity(params) {
@@ -605,10 +668,11 @@ function renderResults(scenario) {
       ${kpiCard("Оплачиваемых активаций / мес", numCompact(kpis.paid_activations_base))}
     </div>
     ${stretchKpis}
+    ${renderCashFlowChart(project)}
     ${renderTypical(kpis, scenario)}
     ${renderOpex(kpis, params)}
     ${renderComparison(scenario)}
-    ${renderCharts(project, scenario, payback)}
+    ${renderOtherCharts(project, scenario, payback)}
     ${renderSensitivity(params)}
     ${renderMonthTable(project, scenario)}
   `;
@@ -630,7 +694,7 @@ Inc_t = CF_проект,t − CF_подрядчик,t
     <h3>Органика сейчас в Base</h3>
     <p>T_org = ${nf.format(base.traffic_month)}, CR = ${base.conversion_pct}%, оплачиваемые = ${base.paid_partner_share_pct}%, ARPU = ${rub(base.arpu)} → промо ${rub(promo)} / мес.</p>
     <h3>Фазы</h3>
-    <p><b>RnD:</b> доля подрядчика ${base.contractor_share_pct}% с промо + разработка ${rub(base.dev_cost_month)}/мес. <b>Свой сайт:</b> подрядчик = 0. В Base нет зарплат и рекламы.</p>
+    <p><b>RnD:</b> доля подрядчика ${base.contractor_share_rnd ?? base.contractor_share_pct}% с промо + разработка ${rub(base.dev_cost_rnd ?? base.dev_cost_month)}/мес. <b>Свой сайт:</b> подрядчик ${base.contractor_share_ops ?? 0}%. В Base нет зарплат и рекламы.</p>
     <p>SEO: после переезда органика падает до пола и линейно возвращается к 100%. Реклама и статус-кво не проседают. Stretch: Base ${stretch.rnd_months} мес. разработки, пол ${stretch.seo_dip_floor_pct}%.</p>
   </div>`;
 }
@@ -639,7 +703,7 @@ function shell() {
   return `
     <header class="top">
       <h1>ФЭМ <span>промокодов</span></h1>
-      <span style="color:#9ca3af;font-size:12px">база ${nf.format(state.base.traffic_month)} визитов · LTV Black ${nf.format(state.base.black_ltv)} ₽</span>
+      <span style="color:#9ca3af;font-size:12px">база ${nf.format(state.base.traffic_month)} визитов · LTV Black ${nf.format(state.base.black_ltv)} ₽ · сборка 20.08 18:40</span>
       <nav class="tabs">${TABS.map(([id, label]) => `<button data-tab="${id}" class="${state.tab === id ? "active" : ""}">${label}</button>`).join("")}</nav>
     </header>
     <div id="workspace"></div>
@@ -691,6 +755,121 @@ function parseValue(input) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function chartPayload(el) {
+  if (!el._payload) {
+    try {
+      el._payload = JSON.parse(el.getAttribute("data-chart") || "null");
+    } catch {
+      el._payload = null;
+    }
+  }
+  return el._payload;
+}
+
+function formatChartValue(kind, v) {
+  if (kind === "count") return nf.format(Math.round(v));
+  return compact(v);
+}
+
+function hideChartHover(chart) {
+  if (!chart) return;
+  const hover = chart.querySelector(".chart-hover");
+  const tip = chart.querySelector(".chart-tooltip");
+  if (hover) hover.setAttribute("opacity", "0");
+  if (tip) {
+    tip.hidden = true;
+  }
+}
+
+function svgToViewX(svg, clientX) {
+  const rect = svg.getBoundingClientRect();
+  const vb = svg.viewBox.baseVal;
+  return ((clientX - rect.left) / rect.width) * (vb.width || 900);
+}
+
+function chartX(p, i) {
+  const iw = p.w - p.pad.l - p.pad.r;
+  if (p.stacked) return p.pad.l + ((i + 0.5) / p.n) * iw;
+  return p.pad.l + (p.n === 1 ? iw / 2 : (i / (p.n - 1)) * iw);
+}
+
+function chartY(p, v) {
+  const ih = p.h - p.pad.t - p.pad.b;
+  return p.pad.t + ih - ((v - p.min) / (p.max - p.min)) * ih;
+}
+
+function nearestMonth(p, px) {
+  const iw = p.w - p.pad.l - p.pad.r;
+  if (p.stacked) {
+    return Math.min(Math.max(Math.floor(((px - p.pad.l) / iw) * p.n), 0), p.n - 1);
+  }
+  if (p.n <= 1) return 0;
+  return Math.min(Math.max(Math.round(((px - p.pad.l) / iw) * (p.n - 1)), 0), p.n - 1);
+}
+
+function updateChartHover(chart, event) {
+  const payload = chartPayload(chart);
+  const svg = chart.querySelector("svg");
+  const hover = chart.querySelector(".chart-hover");
+  const tip = chart.querySelector(".chart-tooltip");
+  if (!payload || !svg || !hover || !tip) return;
+  const px = svgToViewX(svg, event.clientX);
+  if (px < payload.pad.l || px > payload.w - payload.pad.r) {
+    hideChartHover(chart);
+    return;
+  }
+  const i = nearestMonth(payload, px);
+  const x = chartX(payload, i);
+  hover.setAttribute("opacity", "1");
+  const line = hover.querySelector(".chart-hover-line");
+  const band = hover.querySelector(".chart-hover-band");
+  if (line) {
+    line.setAttribute("x1", x);
+    line.setAttribute("x2", x);
+  }
+  if (band) {
+    const iw = payload.w - payload.pad.l - payload.pad.r;
+    const bw = payload.stacked ? Math.max(8, (iw / payload.n) * 0.72) : 8;
+    band.setAttribute("x", x - bw / 2);
+    band.setAttribute("width", bw);
+  }
+  let acc = 0;
+  hover.querySelectorAll(".chart-hover-dot").forEach((dot) => {
+    const ser = payload.series[Number(dot.dataset.si)];
+    if (!ser) return;
+    const v = ser.values[i] || 0;
+    if (payload.stacked) acc += v;
+    const yv = payload.stacked ? acc : v;
+    dot.setAttribute("cx", x);
+    dot.setAttribute("cy", chartY(payload, yv));
+    dot.setAttribute("display", payload.stacked && Math.abs(v) < 0.5 ? "none" : "inline");
+  });
+  const shown = payload.stacked
+    ? payload.series.filter((ser) => Math.abs(ser.values[i] || 0) >= 0.5)
+    : payload.series;
+  const rows = (shown.length ? shown : payload.series).map((ser) => {
+    const v = ser.values[i] || 0;
+    const cls = payload.yKind === "money" ? moneyClass(v) : "";
+    return `<div class="tt-row"><i class="dot" style="background:${ser.color}"></i><span>${ser.name}</span><b class="${cls}">${formatChartValue(payload.yKind, v)}</b></div>`;
+  }).join("");
+  const total = payload.stacked
+    ? payload.series.reduce((s, ser) => s + (ser.values[i] || 0), 0)
+    : null;
+  const totalRow = total != null
+    ? `<div class="tt-row tt-total"><span>Итого</span><b>${formatChartValue(payload.yKind, total)}</b></div>`
+    : "";
+  tip.hidden = false;
+  tip.innerHTML = `<div class="tt-month">${payload.labels[i]}</div>${rows}${totalRow}`;
+  const tw = tip.offsetWidth;
+  const th = tip.offsetHeight;
+  let left = event.clientX + 16;
+  let top = event.clientY + 16;
+  if (left + tw > window.innerWidth - 8) left = event.clientX - tw - 16;
+  if (top + th > window.innerHeight - 8) top = event.clientY - th - 16;
+  tip.style.left = `${Math.max(8, left)}px`;
+  tip.style.top = `${Math.max(8, top)}px`;
+}
+
 function bind() {
   document.body.addEventListener("click", (e) => {
     const tabBtn = e.target.closest("[data-tab]");
@@ -718,7 +897,7 @@ function bind() {
         });
       } else {
         state[sc].variable_costs = state[sc].variable_costs || [];
-        state[sc].variable_costs.push({ name: "Новая статья", kind: "fixed", value: 0, phase: "own" });
+        state[sc].variable_costs.push({ name: "Новая статья", kind: "fixed", rnd: 0, ops: 0, status_quo: 0 });
       }
       renderWorkspace();
       return;
@@ -750,11 +929,30 @@ function bind() {
       state.num_months = Math.max(1, Math.trunc(parseValue(el)));
     } else {
       state[sc][el.dataset.key] = parseValue(el);
+      if (el.dataset.key === "dev_cost_rnd") state[sc].dev_cost_month = state[sc].dev_cost_rnd;
+      if (el.dataset.key === "contractor_share_rnd") state[sc].contractor_share_pct = state[sc].contractor_share_rnd;
+    }
+    if (el.dataset.k === "kind" && (state.tab === "base" || state.tab === "stretch" || state.tab === "params")) {
+      renderWorkspace();
+      return;
     }
     const results = document.getElementById("results");
     if (results && (state.tab === "base" || state.tab === "stretch")) {
       results.innerHTML = renderResults(state.tab);
     }
+  });
+
+  let activeChart = null;
+  document.body.addEventListener("pointermove", (e) => {
+    const chart = e.target.closest("[data-chart]");
+    if (activeChart && activeChart !== chart) hideChartHover(activeChart);
+    activeChart = chart || null;
+    if (!chart) return;
+    updateChartHover(chart, e);
+  });
+  document.body.addEventListener("pointerleave", () => {
+    if (activeChart) hideChartHover(activeChart);
+    activeChart = null;
   });
 
   window.addEventListener("hashchange", () => {
@@ -774,7 +972,21 @@ function render() {
 
 const defaultsUrl = new URL("./defaults.js", import.meta.url);
 
+function bustStylesheet() {
+  const href = new URL(`./styles.css?t=${Date.now()}`, import.meta.url).href;
+  const existing = [...document.querySelectorAll('link[rel="stylesheet"]')].find((l) => l.href.includes("styles.css"));
+  if (existing) {
+    existing.href = href;
+    return;
+  }
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = href;
+  document.head.appendChild(link);
+}
+
 async function main() {
+  bustStylesheet();
   const bust = `t=${Date.now()}`;
   const mod = await import(`${defaultsUrl.href}?${bust}`);
   defaults = mod.default;

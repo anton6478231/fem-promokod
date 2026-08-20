@@ -200,23 +200,39 @@ function teamForMonth(params, month, phase, statusQuo) {
   return [f(params, "salaries_ops"), 0, 0];
 }
 
+function hasPhaseSplit(raw) {
+  return raw.rnd != null || raw.ops != null || raw.status_quo != null;
+}
+
+function itemRate(raw, phase) {
+  if (hasPhaseSplit(raw)) {
+    let value = 0;
+    if (phase === PHASE_SQ) value = Number(raw.status_quo || 0);
+    else if (phase === PHASE_RND) value = Number(raw.rnd || 0);
+    else value = Number(raw.ops || 0);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  const itemPhase = String(raw.phase || "own");
+  const applies =
+    itemPhase === "both" ||
+    itemPhase === phase ||
+    (phase === PHASE_SQ && (itemPhase === "rnd" || itemPhase === "both" || itemPhase === PHASE_SQ));
+  if (!applies) return null;
+  const value = Number(raw.value || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
 export function calculateVariableCosts(items, phase, traffic, activations, paidActivations, grossRevenue) {
   let total = 0;
   const breakdown = {};
   for (const raw of items || []) {
     const name = String(raw.name || "").trim();
     if (!name) continue;
-    const itemPhase = String(raw.phase || "own");
-    const applies =
-      itemPhase === "both" ||
-      itemPhase === phase ||
-      (phase === PHASE_SQ && (itemPhase === "rnd" || itemPhase === "both" || itemPhase === PHASE_SQ));
-    if (!applies) continue;
+    const value = itemRate(raw, phase);
+    if (value == null) continue;
 
     const kind = String(raw.kind || "fixed");
-    let value = Number(raw.value || 0);
-    if (!Number.isFinite(value)) value = 0;
-
     let amount = 0;
     if (kind === "fixed") amount = value;
     else if (kind === "per_paid_activation") amount = value * paidActivations;
@@ -229,6 +245,12 @@ export function calculateVariableCosts(items, phase, traffic, activations, paidA
   return [total, breakdown];
 }
 
+function phaseAmount(params, phase, rndKey, opsKey, sqKey, fallbackRnd = 0, fallbackOps = 0, fallbackSq = 0) {
+  if (phase === PHASE_SQ) return f(params, sqKey, fallbackSq);
+  if (phase === PHASE_RND) return f(params, rndKey, fallbackRnd);
+  return f(params, opsKey, fallbackOps);
+}
+
 function monthRow(month, params, statusQuo) {
   const rndMonths = Math.max(0, i(params, "rnd_months"));
   let phase;
@@ -239,23 +261,27 @@ function monthRow(month, params, statusQuo) {
 
   if (statusQuo) {
     phase = PHASE_SQ;
-    contractorPct = f(params, "contractor_share_pct") / 100;
-    support = f(params, "support_status_quo");
     vcPhase = PHASE_SQ;
-    devCost = 0;
   } else if (month <= rndMonths) {
     phase = PHASE_RND;
-    contractorPct = f(params, "contractor_share_pct") / 100;
-    support = f(params, "support_rnd");
     vcPhase = PHASE_RND;
-    devCost = Math.max(0, f(params, "dev_cost_month"));
   } else {
     phase = PHASE_OWN;
-    contractorPct = 0;
-    support = f(params, "support_ops");
     vcPhase = PHASE_OWN;
-    devCost = 0;
   }
+
+  const contractorFallback = f(params, "contractor_share_pct");
+  contractorPct = phaseAmount(
+    params, phase,
+    "contractor_share_rnd", "contractor_share_ops", "contractor_share_status_quo",
+    contractorFallback, 0, contractorFallback,
+  ) / 100;
+  support = phaseAmount(params, phase, "support_rnd", "support_ops", "support_status_quo");
+  devCost = Math.max(0, phaseAmount(
+    params, phase,
+    "dev_cost_rnd", "dev_cost_ops", "dev_cost_status_quo",
+    f(params, "dev_cost_month"), 0, 0,
+  ));
 
   const effects = productEffects(params, month, phase);
   const seo = seoOrganicFactor(params, month, phase);
