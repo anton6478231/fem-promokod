@@ -1,4 +1,4 @@
-import { applyBaseConstraints, runModel, sensitivityTable } from "./engine.js?v=20260820-tooltip";
+import { applyBaseConstraints, runModel, sensitivityTable } from "./engine.js?v=20260820-logic";
 
 const ORGANIC_COPY_KEYS = [
   "rnd_months", "traffic_month", "seo_dip_enabled", "seo_dip_floor_pct", "seo_recovery_months",
@@ -678,24 +678,332 @@ function renderResults(scenario) {
   `;
 }
 
+function phaseName(phase) {
+  if (phase === "rnd") return "RnD";
+  if (phase === "own") return "свой сайт";
+  return "статус-кво";
+}
+
+function ratePct(x) {
+  return `${nf1.format((Number(x) || 0) * 100)}%`;
+}
+
+function logicKind(kind) {
+  const hit = KIND_OPTIONS.find(([v]) => v === kind);
+  return hit ? hit[1] : (kind || "fixed");
+}
+
+function vcAmountFormula(kind) {
+  if (kind === "per_paid_activation") return "ставка × (оплаченные органика + оплаченные реклама)";
+  if (kind === "per_activation") return "ставка × (активации органика + активации реклама)";
+  if (kind === "pct_of_revenue") return "валовая выручка × ставка / 100";
+  return "ставка, ₽/мес";
+}
+
+function walkMonth(title, row) {
+  if (!row) return `<h3>${title}</h3><p>Нет такого месяца в горизонте.</p>`;
+  const vc = Object.entries(row.variable_breakdown || {})
+    .map(([n, v]) => `  ${n} = ${rub(v)}`)
+    .join("\n");
+  return `<h3>${title}</h3>
+    <p>Месяц ${row.month}, фаза «${phaseName(row.phase)}», SEO-фактор ${ratePct(row.seo_factor)}.</p>
+    <pre class="formula">T_org = ${nf.format(row.organic_traffic)}
+CR_org = ${ratePct(row.conversion)}
+S_approved_org = ${ratePct(row.approved_share)}
+S_paid_org = ${ratePct(row.paid_share)}
+ARPU = ${rub(row.arpu)}
+активации_org = T_org × CR_org = ${nf.format(row.organic_activations)}
+оплаченные_org = активации_org × S_approved_org × S_paid_org = ${nf.format(row.organic_paid_activations)}
+R_promo_org = оплаченные_org × ARPU = ${rub(row.organic_promo_revenue)}
+
+T_ads = ${nf.format(row.ads_traffic || 0)}
+R_promo_ads = ${rub(row.ads_promo_revenue || 0)}
+R_promo = R_promo_org + R_promo_ads = ${rub(row.promo_revenue)}
+
+R_cards = ${rub(row.card_revenue || 0)}
+R_extra = ${rub(row.extra_product_revenue || 0)}
+R = R_promo + R_cards + R_extra = ${rub(row.gross_revenue)}
+
+подрядчик = R_promo × доля_подрядчика = ${rub(row.contractor_cost)}
+разработка = ${rub(row.dev_cost || 0)}
+поддержка = ${rub(row.support)}
+ЗП сопровождения = ${rub(row.ops_salaries || 0)}
+ЗП доп. RnD = ${rub(row.extra_rnd_salaries || 0)}
+реклама = ${rub(row.ads_cost || 0)}
+переменные = ${rub(row.variable_costs || 0)}${vc ? `\n${vc}` : ""}
+
+затраты = ЗП + поддержка + разработка + переменные + подрядчик + реклама
+        = ${rub(row.total_costs)}
+CF = R − затраты = ${rub(row.cash_flow)}</pre>`;
+}
+
 function renderLogic() {
   const base = scenarioParams("base");
   const stretch = scenarioParams("stretch");
-  const promo = base.traffic_month * (base.conversion_pct / 100) * (base.approved_activation_share_pct / 100) * (base.paid_partner_share_pct / 100) * base.arpu;
+  const baseRun = runModel(base);
+  const stretchRun = runModel(stretch);
+  const b = baseRun.kpis;
+  const s = stretchRun.kpis;
+  const recovery = Math.max(0, Math.trunc(base.seo_recovery_months || 0));
+  const seoOwn = baseRun.project.filter((r) => r.phase === "own").slice(0, recovery + 2);
+  const vcItems = (base.variable_costs || []).filter((x) => String(x.name || "").trim());
+  const rndItems = (stretch.extra_rnd || []).filter((x) => String(x.name || "").trim());
+  const adsEnd = Number(stretch.ads_end_month || 0);
+  const adsWindow = adsEnd > 0
+    ? `месяцы ${Math.max(1, Math.trunc(stretch.ads_start_month || 1))}…${adsEnd}`
+    : `с месяца ${Math.max(1, Math.trunc(stretch.ads_start_month || 1))} до конца горизонта`;
+  const vcTable = vcItems.length
+    ? `<div class="table-wrap logic-table"><table><thead><tr><th>Статья</th><th>Тип</th><th>RnD</th><th>Свой сайт</th><th>Статус-кво</th><th>Как считается</th></tr></thead><tbody>
+      ${vcItems.map((x) => `<tr>
+        <td>${escapeAttr(x.name)}</td>
+        <td>${logicKind(x.kind)}</td>
+        <td>${nf.format(x.rnd || 0)}</td>
+        <td>${nf.format(x.ops || 0)}</td>
+        <td>${nf.format(x.status_quo || 0)}</td>
+        <td>${vcAmountFormula(x.kind)}</td>
+      </tr>`).join("")}
+    </tbody></table></div>`
+    : "<p>Статей затрат нет.</p>";
+  const rndTable = rndItems.length
+    ? `<div class="table-wrap logic-table"><table><thead><tr><th>Инициатива</th><th>Окно ЗП</th><th>ЗП / мес</th><th>Лифты после окна</th></tr></thead><tbody>
+      ${rndItems.map((x) => {
+        const start = Math.max(1, Math.trunc(x.start_month || 1));
+        const dur = Math.max(0, Math.trunc(x.duration_months || 0));
+        const pay = dur > 0 ? `t ∈ [${start}; ${start + dur})` : "выкл (duration = 0)";
+        const salary = (Math.max(0, Number(x.headcount) || 0) * Math.max(0, Number(x.avg_salary) || 0));
+        const lifts = [
+          Number(x.traffic_lift_pct) ? `трафик +${nf1.format(x.traffic_lift_pct)}%` : "",
+          Number(x.conversion_lift_pct) ? `CR +${nf1.format(x.conversion_lift_pct)}%` : "",
+          Number(x.approved_lift_pct) ? `одобренные +${nf1.format(x.approved_lift_pct)}%` : "",
+          Number(x.paid_lift_pct) ? `оплачиваемые +${nf1.format(x.paid_lift_pct)}%` : "",
+          Number(x.arpu_lift_pct) ? `ARPU +${nf1.format(x.arpu_lift_pct)}%` : "",
+          Number(x.extra_revenue_month) ? `R_extra +${rub(x.extra_revenue_month)}/мес` : "",
+        ].filter(Boolean).join(", ") || "нет";
+        return `<tr><td>${escapeAttr(x.name)}</td><td>${pay}</td><td>${rub(salary)}</td><td>${lifts}. Включаются с t ≥ ${start + dur}</td></tr>`;
+      }).join("")}
+    </tbody></table></div>`
+    : "<p>В Stretch нет инициатив extra_rnd.</p>";
+
   return `<div class="panel card-pad logic">
     <h2>Логика модели</h2>
-    <p>Одна формула выручки, два сценария: Base (органика) и Stretch (RnD + реклама).</p>
-    <h3>Формула</h3>
-    <pre class="formula">T_org,t = T_org × L_traffic,t × SEO_t
-R_promo^ch = T_ch × CR_ch × S_approved,ch × S_paid,ch × ARPU
-R = R_promo^org + R_promo^ads + R_black + R_plat + R_extra
-Inc_t = CF_проект,t − CF_подрядчик,t
-Окупаемость = первый месяц, где сумма Inc ≥ 0</pre>
-    <h3>Органика сейчас в Base</h3>
-    <p>T_org = ${nf.format(base.traffic_month)}, CR = ${base.conversion_pct}%, оплачиваемые = ${base.paid_partner_share_pct}%, ARPU = ${rub(base.arpu)} → промо ${rub(promo)} / мес.</p>
-    <h3>Фазы</h3>
-    <p><b>RnD:</b> доля подрядчика ${base.contractor_share_rnd ?? base.contractor_share_pct}% с промо + разработка ${rub(base.dev_cost_rnd ?? base.dev_cost_month)}/мес. <b>Свой сайт:</b> подрядчик ${base.contractor_share_ops ?? 0}%. В Base нет зарплат и рекламы.</p>
-    <p>SEO: после переезда органика падает до пола и линейно возвращается к 100%. Реклама и статус-кво не проседают. Stretch: Base ${stretch.rnd_months} мес. разработки, пол ${stretch.seo_dip_floor_pct}%.</p>
+    <p>Ниже — порядок расчёта, как в движке. Два независимых прогона параметров: Base и Stretch. Каждый месяц считается дважды: проект и статус-кво.</p>
+
+    <h3>1. Горизонт</h3>
+    <pre class="formula">N = max(1, trunc(num_months))           сейчас ${b.num_months}
+RnD_мес = min(max(0, trunc(rnd_months)), N)  сейчас Base ${b.rnd_months}, Stretch ${s.rnd_months}
+t = 1 … N</pre>
+
+    <h3>2. Фаза месяца t</h3>
+    <pre class="formula">если это ряд статус-кво:           phase = status_quo
+иначе если t ≤ RnD_мес:            phase = rnd
+иначе:                             phase = own</pre>
+    <p>Статус-кво каждый месяц считается как будто сайт так и остался у подрядчика: без разработки, без SEO-просадки, без рекламы, без доп. RnD, без лифтов.</p>
+
+    <h3>3. Что обнуляет вкладка Base</h3>
+    <pre class="formula">scenario = base
+extra_rnd = []
+team_schedule = []
+ads_enabled = false
+ads_traffic_month = 0
+ads_cost_month = 0
+team_headcount_rnd = 0
+team_headcount_ops = 0
+salaries_rnd = 0
+salaries_ops = 0
+own_*_lift_pct = 0</pre>
+    <p>Поэтому в Base нет рекламы, зарплат команды, доп. RnD и лифтов. Stretch эти поля не трогает.</p>
+
+    <h3>4. SEO-фактор органики</h3>
+    <pre class="formula">если phase ∈ {status_quo, rnd} или seo_dip_enabled = нет:
+    SEO = 1
+
+floor = min(max(seo_dip_floor_pct / 100, 0), 1)     сейчас ${ratePct((base.seo_dip_floor_pct || 0) / 100)}
+recovery = max(0, trunc(seo_recovery_months))     сейчас ${recovery}
+elapsed = t − RnD_мес                             номер месяца на своём сайте
+
+elapsed ≤ 0            → SEO = 1
+recovery ≤ 0           → SEO = floor
+elapsed > recovery     → SEO = 1
+recovery = 1           → SEO = floor
+иначе:
+    progress = (elapsed − 1) / (recovery − 1)
+    SEO = floor + (1 − floor) × progress</pre>
+    <p>Реклама и статус-кво SEO не умножают. Первый свой месяц (elapsed = 1) всегда даёт SEO = floor. К 100% линейно приходит на месяце elapsed = recovery.</p>
+    ${seoOwn.length ? `<div class="table-wrap logic-table"><table><thead><tr><th>Месяц проекта</th><th>elapsed</th><th>SEO</th><th>T_org</th></tr></thead><tbody>
+      ${seoOwn.map((r) => `<tr><td>M${r.month}</td><td>${r.month - b.rnd_months}</td><td>${ratePct(r.seo_factor)}</td><td>${nf.format(r.organic_traffic)}</td></tr>`).join("")}
+    </tbody></table></div>` : ""}
+
+    <h3>5. Лифты продукта L (только Stretch и только phase = own)</h3>
+    <pre class="formula">старт: L_traffic = L_cr = L_approved = L_paid = L_arpu = 1, R_extra = 0
+
+если не Stretch или phase ∈ {status_quo, rnd}: лифты не применяются (все L = 1, R_extra = 0)
+
+иначе:
+  L_x *= 1 + own_x_lift_pct / 100
+    сейчас Stretch: трафик ${nf1.format(stretch.own_traffic_lift_pct || 0)}%,
+    CR ${nf1.format(stretch.own_conversion_lift_pct || 0)}%,
+    одобренные ${nf1.format(stretch.own_approved_share_lift_pct || 0)}%,
+    оплачиваемые ${nf1.format(stretch.own_paid_share_lift_pct || 0)}%,
+    ARPU ${nf1.format(stretch.own_arpu_lift_pct || 0)}%
+
+  для каждой инициативы extra_rnd:
+    start = max(1, trunc(start_month))
+    duration = max(0, trunc(duration_months))
+    doneAt = start + duration
+    если t ≥ doneAt:
+      L_x *= 1 + lift_pct инициативы / 100
+      R_extra += max(0, extra_revenue_month)
+
+  затем L_x = max(L_x, 0)</pre>
+    <p>Лифты инициативы включаются <b>после</b> окна зарплаты, не во время него. Несколько инициатив перемножаются.</p>
+    ${rndTable}
+
+    <h3>6. Органическая воронка</h3>
+    <pre class="formula">T_org = max(0, traffic_month × L_traffic × SEO)
+CR_org = min(max(conversion_pct / 100 × L_cr, 0), 1)
+S_approved_org = min(max(approved_activation_share_pct / 100 × L_approved, 0), 1)
+S_paid_org = min(max(paid_partner_share_pct / 100 × L_paid, 0), 1)
+ARPU = max(0, arpu × L_arpu)
+
+активации_org = T_org × CR_org
+одобренные_org = активации_org × S_approved_org
+оплаченные_org = одобренные_org × S_paid_org
+R_promo_org = оплаченные_org × ARPU</pre>
+    <p>Сейчас в панели Base: T_org база = ${nf.format(base.traffic_month)}, CR = ${nf1.format(base.conversion_pct)}%, одобренные = ${nf1.format(base.approved_activation_share_pct)}%, оплачиваемые = ${nf1.format(base.paid_partner_share_pct)}%, ARPU = ${rub(base.arpu)}.</p>
+    <p>Без лифтов и при SEO = 1: ${nf.format(base.traffic_month)} × ${nf1.format(base.conversion_pct)}% × ${nf1.format(base.approved_activation_share_pct)}% × ${nf1.format(base.paid_partner_share_pct)}% × ${nf.format(base.arpu)} = <b>${rub(b.promo_revenue_base)}</b> промо / мес.</p>
+
+    <h3>7. Реклама (только Stretch, не статус-кво)</h3>
+    <pre class="formula">реклама включена, если:
+  Stretch
+  и ads_enabled
+  и t ≥ max(1, trunc(ads_start_month))
+  и (ads_end_month = 0 или t ≤ ads_end_month)
+
+иначе T_ads = 0, R_promo_ads = 0, ads_cost = 0
+
+если включена:
+  T_ads = max(0, ads_traffic_month)          без SEO и без L_traffic
+  CR_ads = min(max(conversion_pct_ads / 100 × L_cr, 0), 1)
+  S_approved_ads = min(max(approved_activation_share_pct_ads / 100 × L_approved, 0), 1)
+  S_paid_ads = min(max(paid_partner_share_pct_ads / 100 × L_paid, 0), 1)
+  ARPU_ads = max(0, arpu × L_arpu)           тот же arpu, что у органики
+  ads_cost = max(0, ads_cost_month)
+
+  R_promo_ads = T_ads × CR_ads × S_approved_ads × S_paid_ads × ARPU_ads</pre>
+    <p>Сейчас Stretch: ${stretch.ads_enabled ? "включена" : "выключена"}, окно ${adsWindow}, T_ads = ${nf.format(stretch.ads_traffic_month || 0)}, бюджет = ${rub(stretch.ads_cost_month || 0)}, CR = ${nf1.format(stretch.conversion_pct_ads || 0)}%, одобренные = ${nf1.format(stretch.approved_activation_share_pct_ads || 0)}%, оплачиваемые = ${nf1.format(stretch.paid_partner_share_pct_ads || 0)}%.</p>
+
+    <h3>8. Карты</h3>
+    <pre class="formula">T = T_org + T_ads
+
+S_black = card_black_enabled ? min(max(black_share_pct / 100, 0), 1) : 0
+S_plat  = card_platinum_enabled ? min(max(platinum_share_pct / 100, 0), 1) : 0
+
+R_black = T × S_black × max(0, black_ltv)
+R_plat  = T × S_plat  × max(0, platinum_ltv)
+R_cards = R_black + R_plat</pre>
+    <p>LTV целиком в месяц оформления. Доля подрядчика на карты не режется. Сейчас доли ${nf1.format(base.black_share_pct || 0)}% Black и ${nf1.format(base.platinum_share_pct || 0)}% Platinum, LTV ${rub(base.black_ltv)} и ${rub(base.platinum_ltv)}.</p>
+
+    <h3>9. Валовая выручка</h3>
+    <pre class="formula">R_promo = R_promo_org + R_promo_ads
+R_extra = 0 в статус-кво, иначе сумма extra_revenue_month сработавших инициатив
+R = R_promo + R_cards + R_extra</pre>
+
+    <h3>10. Доля подрядчика</h3>
+    <pre class="formula">pct(phase):
+  status_quo → contractor_share_status_quo   иначе contractor_share_pct
+  rnd        → contractor_share_rnd          иначе contractor_share_pct
+  own        → contractor_share_ops          иначе 0
+
+подрядчик = R_promo × pct / 100</pre>
+    <p>Режется только промо, не карты и не R_extra. Сейчас Base: RnD ${nf1.format(base.contractor_share_rnd ?? base.contractor_share_pct)}%, свой сайт ${nf1.format(base.contractor_share_ops || 0)}%, статус-кво ${nf1.format(base.contractor_share_status_quo ?? base.contractor_share_pct)}%.</p>
+
+    <h3>11. Разработка и поддержка</h3>
+    <pre class="formula">разработка(phase) = max(0, ₽/мес этой фазы)
+  rnd:        dev_cost_rnd, иначе dev_cost_month
+  own:        dev_cost_ops, иначе 0
+  status_quo: dev_cost_status_quo, иначе 0
+
+поддержка(phase):
+  rnd / own / status_quo → support_rnd / support_ops / support_status_quo</pre>
+    <p>Сейчас разработка ${rub(base.dev_cost_rnd ?? base.dev_cost_month)} / ${rub(base.dev_cost_ops || 0)} / ${rub(base.dev_cost_status_quo || 0)}. Поддержка ${rub(base.support_rnd)} / ${rub(base.support_ops)} / ${rub(base.support_status_quo)}.</p>
+
+    <h3>12. Зарплаты</h3>
+    <pre class="formula">статус-кво:  salaries_status_quo                    сейчас ${rub(base.salaries_status_quo || 0)}
+Base:        0
+
+Stretch, если есть team_schedule на этот t:
+  ЗП_сопровождения = max(0, headcount) × max(0, avg_salary)
+
+Stretch, phase = rnd:
+  если team_headcount_rnd != 0 или team_avg_salary_rnd != 0:
+    ЗП_сопровождения = max(0, headcount_rnd) × max(0, avg_salary_rnd)
+  иначе salaries_rnd
+
+Stretch, phase = own:
+  если team_headcount_ops != 0 или team_avg_salary_ops != 0:
+    ЗП_сопровождения = max(0, headcount_ops) × max(0, avg_salary_ops)
+  иначе salaries_ops
+
+ЗП доп. RnD (только Stretch, в статус-кво = 0):
+  сумма по инициативам, где duration > 0 и start ≤ t < start + duration:
+    headcount × avg_salary
+
+ЗП = ЗП_сопровождения + ЗП доп. RnD</pre>
+
+    <h3>13. Статьи затрат</h3>
+    <pre class="formula">ставка(phase) = rnd / ops / status_quo у статьи
+
+fixed:                 сумма = ставка
+per_paid_activation:   сумма = ставка × оплаченные (органика + реклама)
+per_activation:        сумма = ставка × активации (органика + реклама)
+pct_of_revenue:        сумма = R × ставка / 100
+
+переменные = сумма статей</pre>
+    ${vcTable}
+
+    <h3>14. Затраты и CF месяца</h3>
+    <pre class="formula">фикс = ЗП + поддержка + разработка
+затраты = фикс + переменные + подрядчик + ads_cost
+CF_t = R − затраты</pre>
+    <p>В ряде статус-кво после расчёта принудительно: ads_cost = 0, ЗП доп. RnD = 0, R_extra = 0.</p>
+
+    <h3>15. Инкремент и окупаемость</h3>
+    <pre class="formula">Inc_t = CF_проект,t − CF_статус-кво,t
+накопленный CF_t = сумма CF_проект с 1 по t
+накопленный Inc_t = сумма Inc с 1 по t
+
+окупаемость vs подрядчик = первый t, где накопленный Inc_t ≥ 0
+окупаемость проекта     = первый t, где накопленный CF_t ≥ 0
+если не случилось за N месяцев — «нет»
+
+инвестиции на разработке = max(0, − сумма Inc_t по месяцам phase = rnd)</pre>
+    <p>Сейчас Base: окупаемость vs подрядчик ${b.payback_incremental_month ? `${b.payback_incremental_month} мес.` : "нет"}, накопленный Inc = ${rub(b.final_cumulative_incremental)}, CF проекта = ${rub(b.total_cf)}, инвестиции RnD = ${rub(b.rnd_investment)}.</p>
+    <p>Stretch: окупаемость vs подрядчик ${s.payback_incremental_month ? `${s.payback_incremental_month} мес.` : "нет"}, накопленный Inc = ${rub(s.final_cumulative_incremental)}, CF проекта = ${rub(s.total_cf)}.</p>
+
+    <h3>16. Суммы за горизонт</h3>
+    <pre class="formula">выручка за N мес. = сумма R
+затраты за N мес. = сумма затраты
+CF проекта        = сумма CF_проект
+промо органика    = сумма R_promo_org
+промо реклама     = сумма R_promo_ads
+бюджет рекламы    = сумма ads_cost
+ЗП доп. RnD       = сумма ЗП доп. RnD</pre>
+
+    <h3>17. Чувствительность</h3>
+    <p>Для каждого драйвера (трафик, CR, одобренные, оплачиваемые, ARPU, доли и LTV карт; если SEO включён — пол и recovery; в Stretch при рекламе — T_ads, CR_ads, paid_ads, бюджет) параметр умножается на 0,8 / 1,0 / 1,2. Пересчитывается вся модель. В таблице — итоговый Inc и окупаемость vs подрядчик.</p>
+
+    <h3>18. Как выбирается «типовой месяц» на вкладках</h3>
+    <pre class="formula">статус-кво     = первый месяц ряда статус-кво
+RnD            = первый месяц phase = rnd
+первый свой    = первый месяц phase = own
+свой после SEO = первый own, где SEO ≥ 0,999; иначе последний own</pre>
+
+    ${walkMonth("Пример: статус-кво, Base", b.typical_sq)}
+    ${walkMonth("Пример: RnD, Base", b.typical_rnd)}
+    ${walkMonth("Пример: первый свой месяц, Base", b.typical_own_launch)}
+    ${b.typical_own && b.typical_own_launch && b.typical_own.month !== b.typical_own_launch.month
+      ? walkMonth("Пример: свой сайт после SEO = 100%, Base", b.typical_own)
+      : ""}
   </div>`;
 }
 
@@ -703,7 +1011,7 @@ function shell() {
   return `
     <header class="top">
       <h1>ФЭМ <span>промокодов</span></h1>
-      <span style="color:#9ca3af;font-size:12px">база ${nf.format(state.base.traffic_month)} визитов · LTV Black ${nf.format(state.base.black_ltv)} ₽ · сборка 20.08 18:40</span>
+      <span style="color:#9ca3af;font-size:12px">база ${nf.format(state.base.traffic_month)} визитов · LTV Black ${nf.format(state.base.black_ltv)} ₽ · сборка 20.08 19:30</span>
       <nav class="tabs">${TABS.map(([id, label]) => `<button data-tab="${id}" class="${state.tab === id ? "active" : ""}">${label}</button>`).join("")}</nav>
     </header>
     <div id="workspace"></div>
