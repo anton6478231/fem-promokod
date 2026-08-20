@@ -549,14 +549,14 @@ def render_organic_block(scenario: str) -> None:
         skey(scenario, "traffic_month"),
         min_value=0, max_value=50_000_000,
         decimals=0, as_int=True,
-        help="Текущий органический поток. База: 5 млн/год ÷ 12 ≈ 417 000.",
+        help="Текущий органический поток. База: 250 000 визитов/мес.",
     )
     formula_number_input(
         "Конверсия в активацию (органика), %",
         skey(scenario, "conversion_pct"),
         min_value=0.0, max_value=100.0,
         decimals=1,
-        help="Доля органических визитов с кликом «Активировать». База ≈ 10%.",
+        help="Доля органических визитов с кликом «Активировать». База 44%.",
     )
     formula_number_input(
         "Доля одобренных активаций (органика), %",
@@ -570,14 +570,14 @@ def render_organic_block(scenario: str) -> None:
         skey(scenario, "paid_partner_share_pct"),
         min_value=0.0, max_value=100.0,
         decimals=1,
-        help="Какая часть одобренных активаций подтверждена партнёром и приносит деньги. База ≈ 10%.",
+        help="Какая часть одобренных активаций подтверждена партнёром и приносит деньги. База 100%.",
     )
     formula_number_input(
         "ARPU, ₽ за оплаченную активацию",
         skey(scenario, "arpu"),
         min_value=0.0, max_value=100_000.0,
         decimals=0,
-        help="Средняя выплата партнёра. Общая для органики и рекламы. База 250 ₽ (оценочно).",
+        help="Средняя выплата партнёра. Общая для органики и рекламы. База 150 ₽.",
     )
     formula_number_input(
         "Доля подрядчика, % от промо-выручки",
@@ -607,7 +607,7 @@ def render_seo_dip_block(scenario: str) -> None:
             skey(scenario, "seo_dip_floor_pct"),
             min_value=0.0, max_value=100.0,
             decimals=0,
-            help="База 70%: в месяц переезда внешний трафик = 0.7 × текущая органика.",
+            help="База 80%: в месяц переезда внешний трафик = 0.8 × текущая органика.",
         )
     with c2:
         st.number_input(
@@ -616,7 +616,7 @@ def render_seo_dip_block(scenario: str) -> None:
             key=skey(scenario, "seo_recovery_months"),
             help=(
                 "За сколько месяцев своего сайта органика линейно дойдёт до 100%. "
-                "6 = первый свой месяц 70%, шестой — 100%. 0 = пол навсегда."
+                "6 = первый свой месяц 80%, шестой — 100%. 0 = пол навсегда."
             ),
         )
 
