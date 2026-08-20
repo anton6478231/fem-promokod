@@ -2,7 +2,7 @@
 
 Интерактивная финансовая модель. Открывается в браузере сразу, без установки Python.
 
-**Ссылка:** https://anton6478231.github.io/fem-promokod/
+**Ссылка (без кэша):** https://anton6478231.github.io/fem-promokod/start.html
 
 Расчёт тот же, что в локальном Streamlit: Base vs Stretch, SEO-просадка, инкремент к подрядчику.
 

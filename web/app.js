@@ -103,10 +103,10 @@ function field(sc, key, label, opts = {}) {
   const value = key === "num_months" ? state.num_months : state[sc][key];
   const type = opts.check ? "checkbox" : "number";
   if (opts.check) {
-    return `<label class="check"><input type="checkbox" data-sc="${sc}" data-key="${key}" ${value ? "checked" : ""}>${label}</label>`;
+    return `<label class="check"><input type="checkbox" autocomplete="off" data-sc="${sc}" data-key="${key}" ${value ? "checked" : ""}>${label}</label>`;
   }
   const step = opts.step ?? 1;
-  return `<label class="field">${label}<input type="${type}" data-sc="${sc}" data-key="${key}" value="${value ?? 0}" step="${step}"></label>`;
+  return `<label class="field">${label}<input type="${type}" autocomplete="off" data-sc="${sc}" data-key="${key}" value="${value ?? 0}" step="${step}"></label>`;
 }
 
 function formBlocks(sc, { full = false } = {}) {
@@ -639,6 +639,7 @@ function shell() {
   return `
     <header class="top">
       <h1>ФЭМ <span>промокодов</span></h1>
+      <span style="color:#9ca3af;font-size:12px">база ${nf.format(state.base.traffic_month)} визитов · LTV Black ${nf.format(state.base.black_ltv)} ₽</span>
       <nav class="tabs">${TABS.map(([id, label]) => `<button data-tab="${id}" class="${state.tab === id ? "active" : ""}">${label}</button>`).join("")}</nav>
     </header>
     <div id="workspace"></div>
@@ -771,11 +772,12 @@ function render() {
   renderWorkspace();
 }
 
-const defaultsUrl = new URL("../config/defaults.json", import.meta.url);
+const defaultsUrl = new URL("./defaults.js", import.meta.url);
 
 async function main() {
-  const res = await fetch(defaultsUrl);
-  defaults = await res.json();
+  const bust = `t=${Date.now()}`;
+  const mod = await import(`${defaultsUrl.href}?${bust}`);
+  defaults = mod.default;
   state = initState(defaults);
   if (location.hash.replace("#", "")) state.tab = location.hash.replace("#", "");
   bind();
@@ -784,4 +786,8 @@ async function main() {
 
 main().catch((err) => {
   document.getElementById("app").innerHTML = `<p style="padding:24px">Не удалось загрузить модель: ${err.message}</p>`;
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) window.location.reload();
 });
