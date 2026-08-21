@@ -5,6 +5,16 @@ const PHASE_RND = "rnd";
 const PHASE_SQ = "status_quo";
 const SCENARIO_BASE = "base";
 const SCENARIO_STRETCH = "stretch";
+const SCENARIO_PESS = "pess";
+
+export const PESS_HAIRCUT = {
+  seo_dip_floor_pct: 70,
+  seo_recovery_months: 9,
+  seo_final_pct: 90,
+  rnd_months: 4,
+  dev_cost_rnd: 2200000,
+  support_ops: 80000,
+};
 
 function f(params, key, def = 0) {
   const raw = params[key];
@@ -27,8 +37,16 @@ function enabled(params, key, def = true) {
   return Boolean(value);
 }
 
-function isStretch(params) {
+function clamp01(value) {
+  return Math.min(Math.max(value, 0), 1);
+}
+
+export function isStretch(params) {
   return String(params.scenario || SCENARIO_BASE).trim().toLowerCase() === SCENARIO_STRETCH;
+}
+
+export function isPess(params) {
+  return String(params.scenario || SCENARIO_BASE).trim().toLowerCase() === SCENARIO_PESS;
 }
 
 function clone(value) {
@@ -37,9 +55,9 @@ function clone(value) {
 
 function channelPromo(traffic, conversion, approvedShare, paidShare, arpu) {
   traffic = Math.max(traffic, 0);
-  conversion = Math.min(Math.max(conversion, 0), 1);
-  approvedShare = Math.min(Math.max(approvedShare, 0), 1);
-  paidShare = Math.min(Math.max(paidShare, 0), 1);
+  conversion = clamp01(conversion);
+  approvedShare = clamp01(approvedShare);
+  paidShare = clamp01(paidShare);
   arpu = Math.max(arpu, 0);
   const activations = traffic * conversion;
   const approved = activations * approvedShare;
@@ -47,15 +65,141 @@ function channelPromo(traffic, conversion, approvedShare, paidShare, arpu) {
   return [activations, approved, paid, paid * arpu];
 }
 
-export function cardOriginations(params, traffic) {
-  let blackShare = enabled(params, "card_black_enabled") ? f(params, "black_share_pct") / 100 : 0;
-  let platinumShare = enabled(params, "card_platinum_enabled") ? f(params, "platinum_share_pct") / 100 : 0;
-  blackShare = Math.min(Math.max(blackShare, 0), 1);
-  platinumShare = Math.min(Math.max(platinumShare, 0), 1);
+function ownStart(params) {
+  return Math.max(0, i(params, "rnd_months")) + 1;
+}
+
+function clampedLaunch(params, key, fallback) {
+  return Math.max(ownStart(params), i(params, key, fallback));
+}
+
+function trendFactor(params, month) {
+  const annual = f(params, "traffic_trend_pct") / 100;
+  if (!annual) return 1;
+  return (1 + annual) ** ((month - 1) / 12);
+}
+
+function ownRamp(startPct, targetPct, elapsed, rampMonths) {
+  const start = clamp01(startPct / 100);
+  const target = clamp01(targetPct / 100);
+  if (elapsed <= 0) return 1;
+  if (start === target) return target;
+  if (rampMonths <= 0) return target;
+  if (elapsed >= rampMonths) return target;
+  if (rampMonths === 1) return start;
+  const progress = (elapsed - 1) / (rampMonths - 1);
+  return start + (target - start) * progress;
+}
+
+function coverageFactor(params, month, phase) {
+  if (phase === PHASE_SQ || phase === PHASE_RND) return 1;
+  const elapsed = month - Math.max(0, i(params, "rnd_months"));
+  return ownRamp(
+    f(params, "coverage_start_pct", 100),
+    f(params, "coverage_target_pct", 100),
+    elapsed,
+    i(params, "coverage_ramp_months", 0),
+  );
+}
+
+function monetizationFactor(params, month, phase) {
+  if (phase === PHASE_SQ || phase === PHASE_RND) return 1;
+  const elapsed = month - Math.max(0, i(params, "rnd_months"));
+  return ownRamp(
+    f(params, "mon_start_pct", 100),
+    f(params, "mon_target_pct", 100),
+    elapsed,
+    i(params, "mon_ramp_months", 0),
+  );
+}
+
+export function tidEffects(params, month, phase, statusQuo = false) {
+  const idle = { factor: 0, repeatTraffic: 0, convFactor: 1, cardFactor: 1 };
+  if (statusQuo || !isStretch(params) || phase !== PHASE_OWN) return idle;
+  if (!enabled(params, "tid_enabled", false)) return idle;
+  const launch = clampedLaunch(params, "tid_launch", 4);
+  if (month < launch) return idle;
+  const ramp = Math.max(1, i(params, "tid_ramp_months", 6));
+  const factor = clamp01((month - launch + 1) / ramp);
+  const auth = Math.max(0, f(params, "tid_auth_share_pct") / 100);
+  const repeatLift = Math.max(0, f(params, "tid_repeat_lift_pct") / 100);
+  const cpaLift = Math.max(0, f(params, "tid_cpa_lift_pct") / 100);
+  const cardLift = Math.max(0, f(params, "tid_card_lift_pct") / 100);
+  return {
+    factor,
+    repeatTraffic: Math.max(0, f(params, "traffic_month")) * auth * repeatLift * factor,
+    convFactor: 1 + auth * cpaLift * factor,
+    cardFactor: 1 + auth * cardLift * factor,
+  };
+}
+
+function distributionTraffic(params, month, phase, statusQuo = false) {
+  if (statusQuo || !isStretch(params) || phase !== PHASE_OWN) return 0;
+  const launch = clampedLaunch(params, "distribution_launch", 7);
+  if (month < launch) return 0;
+  return Math.max(0, f(params, "stretch_extra_traffic"));
+}
+
+function distributionCost(params, month, phase, statusQuo = false) {
+  if (statusQuo || !isStretch(params) || phase !== PHASE_OWN) return 0;
+  const launch = clampedLaunch(params, "distribution_launch", 7);
+  if (month < launch) return 0;
+  return Math.max(0, f(params, "distribution_cost"));
+}
+
+export function onsiteAdRevenue(params, traffic, month, phase, statusQuo = false) {
+  if (statusQuo || !isStretch(params) || phase !== PHASE_OWN) return 0;
+  if (!enabled(params, "onsite_ads_enabled", false)) return 0;
+  const launch = clampedLaunch(params, "onsite_ad_launch", 4);
+  if (month < launch) return 0;
+  const impressions = Math.max(0, f(params, "onsite_ad_impressions"));
+  const fill = clamp01(f(params, "onsite_ad_fill_pct") / 100);
+  const ecpm = Math.max(0, f(params, "onsite_ad_ecpm"));
+  return Math.max(0, traffic) * impressions * fill * ecpm / 1000;
+}
+
+export function cardOriginations(params, traffic, month = 1, phase = PHASE_OWN, statusQuo = false) {
+  const tid = tidEffects(params, month, phase, statusQuo);
+  const blackOn = enabled(params, "card_black_enabled");
+  const platOn = enabled(params, "card_platinum_enabled");
   const blackLtv = Math.max(0, f(params, "black_ltv"));
   const platinumLtv = Math.max(0, f(params, "platinum_ltv"));
-  const blackApps = traffic * blackShare;
-  const platinumApps = traffic * platinumShare;
+
+  if (
+    isStretch(params)
+    && !statusQuo
+    && phase === PHASE_OWN
+    && enabled(params, "bank_enabled", false)
+  ) {
+    const launch = clampedLaunch(params, "bank_launch", 5);
+    if (month < launch) return [0, 0, 0, 0, 0];
+    const ramp = Math.max(1, i(params, "bank_ramp_months", 6));
+    const bankFactor = clamp01((month - launch + 1) / ramp);
+    const scale = bankFactor * tid.cardFactor;
+    const debitRate = blackOn
+      ? clamp01(f(params, "debit_show_pct") / 100)
+        * clamp01(f(params, "debit_util_pct") / 100)
+        * clamp01(f(params, "debit_inc_pct") / 100)
+      : 0;
+    const creditRate = platOn
+      ? clamp01(f(params, "credit_show_pct") / 100)
+        * clamp01(f(params, "credit_util_pct") / 100)
+        * clamp01(f(params, "credit_inc_pct") / 100)
+      : 0;
+    const blackApps = traffic * debitRate * scale;
+    const platinumApps = traffic * creditRate * scale;
+    const blackRevenue = blackApps * blackLtv;
+    const platinumRevenue = platinumApps * platinumLtv;
+    return [blackApps, platinumApps, blackRevenue, platinumRevenue, blackRevenue + platinumRevenue];
+  }
+
+  let blackShare = blackOn ? f(params, "black_share_pct") / 100 : 0;
+  let platinumShare = platOn ? f(params, "platinum_share_pct") / 100 : 0;
+  blackShare = clamp01(blackShare);
+  platinumShare = clamp01(platinumShare);
+  const cardScale = (!statusQuo && phase === PHASE_OWN) ? tid.cardFactor : 1;
+  const blackApps = traffic * blackShare * cardScale;
+  const platinumApps = traffic * platinumShare * cardScale;
   const blackRevenue = blackApps * blackLtv;
   const platinumRevenue = platinumApps * platinumLtv;
   return [blackApps, platinumApps, blackRevenue, platinumRevenue, blackRevenue + platinumRevenue];
@@ -87,16 +231,17 @@ export function extraRndPayroll(params, month) {
 export function seoOrganicFactor(params, month, phase) {
   if (phase === PHASE_SQ || phase === PHASE_RND) return 1;
   if (!enabled(params, "seo_dip_enabled", true)) return 1;
-  const floor = Math.min(Math.max(f(params, "seo_dip_floor_pct", 70) / 100, 0), 1);
+  const floor = clamp01(f(params, "seo_dip_floor_pct", 70) / 100);
+  const final = clamp01(f(params, "seo_final_pct", 100) / 100);
   const recovery = Math.max(0, i(params, "seo_recovery_months", 6));
   const rndMonths = Math.max(0, i(params, "rnd_months"));
   const elapsed = month - rndMonths;
   if (elapsed <= 0) return 1;
   if (recovery <= 0) return floor;
-  if (elapsed > recovery) return 1;
+  if (elapsed > recovery) return final;
   if (recovery === 1) return floor;
   const progress = (elapsed - 1) / (recovery - 1);
-  return floor + (1 - floor) * progress;
+  return floor + (final - floor) * progress;
 }
 
 export function productEffects(params, month, phase) {
@@ -133,18 +278,24 @@ export function productEffects(params, month, phase) {
   return effects;
 }
 
-export function funnelRates(params, phase, month = 1) {
+export function funnelRates(params, phase, month = 1, statusQuo = false) {
   const effects = productEffects(params, month, phase);
   const seo = seoOrganicFactor(params, month, phase);
-  const traffic = Math.max(0, f(params, "traffic_month") * effects.traffic * seo);
-  const conversion = Math.min(Math.max((f(params, "conversion_pct") / 100) * effects.conversion, 0), 1);
-  const approvedShare = Math.min(
-    Math.max((f(params, "approved_activation_share_pct", 100) / 100) * effects.approved, 0),
-    1,
-  );
-  const paidShare = Math.min(Math.max((f(params, "paid_partner_share_pct") / 100) * effects.paid, 0), 1);
-  const arpu = Math.max(0, f(params, "arpu") * effects.arpu);
-  return [traffic, conversion, approvedShare, paidShare, arpu];
+  const tid = tidEffects(params, month, phase, statusQuo);
+  const coverage = coverageFactor(params, month, phase);
+  const monetization = monetizationFactor(params, month, phase);
+  const trend = trendFactor(params, month);
+  const seoShare = clamp01(f(params, "seo_share_pct", 100) / 100);
+  const baseOrganic = Math.max(0, f(params, "traffic_month") * effects.traffic * trend);
+  const seoTraffic = baseOrganic * seoShare * seo;
+  const otherTraffic = baseOrganic * (1 - seoShare);
+  const extraTraffic = tid.repeatTraffic + distributionTraffic(params, month, phase, statusQuo);
+  const traffic = seoTraffic + otherTraffic + extraTraffic;
+  const conversion = clamp01((f(params, "conversion_pct") / 100) * effects.conversion * tid.convFactor);
+  const approvedShare = clamp01((f(params, "approved_activation_share_pct", 100) / 100) * effects.approved);
+  const paidShare = clamp01((f(params, "paid_partner_share_pct") / 100) * effects.paid);
+  const arpu = Math.max(0, f(params, "arpu") * effects.arpu * coverage * monetization);
+  return [traffic, conversion, approvedShare, paidShare, arpu, seoTraffic, otherTraffic, extraTraffic];
 }
 
 export function adsActive(params, month, phase) {
@@ -157,17 +308,17 @@ export function adsActive(params, month, phase) {
   return true;
 }
 
-export function adsFunnel(params, month, phase) {
+export function adsFunnel(params, month, phase, statusQuo = false) {
   if (!adsActive(params, month, phase)) return [0, 0, 0, 0, 0, 0];
   const effects = productEffects(params, month, phase);
+  const tid = tidEffects(params, month, phase, statusQuo);
+  const coverage = coverageFactor(params, month, phase);
+  const monetization = monetizationFactor(params, month, phase);
   const traffic = Math.max(0, f(params, "ads_traffic_month"));
-  const conversion = Math.min(Math.max((f(params, "conversion_pct_ads") / 100) * effects.conversion, 0), 1);
-  const approvedShare = Math.min(
-    Math.max((f(params, "approved_activation_share_pct_ads", 100) / 100) * effects.approved, 0),
-    1,
-  );
-  const paidShare = Math.min(Math.max((f(params, "paid_partner_share_pct_ads") / 100) * effects.paid, 0), 1);
-  const arpu = Math.max(0, f(params, "arpu") * effects.arpu);
+  const conversion = clamp01((f(params, "conversion_pct_ads") / 100) * effects.conversion * tid.convFactor);
+  const approvedShare = clamp01((f(params, "approved_activation_share_pct_ads", 100) / 100) * effects.approved);
+  const paidShare = clamp01((f(params, "paid_partner_share_pct_ads") / 100) * effects.paid);
+  const arpu = Math.max(0, f(params, "arpu") * effects.arpu * coverage * monetization);
   const cost = Math.max(0, f(params, "ads_cost_month"));
   return [traffic, conversion, approvedShare, paidShare, arpu, cost];
 }
@@ -285,9 +436,12 @@ function monthRow(month, params, statusQuo) {
 
   const effects = productEffects(params, month, phase);
   const seo = seoOrganicFactor(params, month, phase);
-  const orgPreSeo = Math.max(0, f(params, "traffic_month") * effects.traffic);
-  const [orgTraffic, orgCr, orgApproved, orgPaid, orgArpu] = funnelRates(params, phase, month);
-  let [adsTraffic, adsCr, adsApproved, adsPaid, adsArpu, adsCost] = adsFunnel(params, month, phase);
+  const tid = tidEffects(params, month, phase, statusQuo);
+  const coverage = coverageFactor(params, month, phase);
+  const monetization = monetizationFactor(params, month, phase);
+  const orgPreSeo = Math.max(0, f(params, "traffic_month") * effects.traffic * trendFactor(params, month));
+  const [orgTraffic, orgCr, orgApproved, orgPaid, orgArpu] = funnelRates(params, phase, month, statusQuo);
+  let [adsTraffic, adsCr, adsApproved, adsPaid, adsArpu, adsCost] = adsFunnel(params, month, phase, statusQuo);
 
   const [orgAct, orgAppr, orgPaidN, orgPromo] = channelPromo(orgTraffic, orgCr, orgApproved, orgPaid, orgArpu);
   const [adsAct, adsAppr, adsPaidN, adsPromo] = channelPromo(adsTraffic, adsCr, adsApproved, adsPaid, adsArpu);
@@ -298,9 +452,17 @@ function monthRow(month, params, statusQuo) {
   const paidActivations = orgPaidN + adsPaidN;
   const promoRevenue = orgPromo + adsPromo;
   let extraProductRevenue = statusQuo ? 0 : effects.extra_revenue;
+  let onsiteAds = onsiteAdRevenue(params, traffic, month, phase, statusQuo);
+  let distCost = distributionCost(params, month, phase, statusQuo);
+  let transition = 0;
+  if (!statusQuo && month === rndMonths + 1) {
+    transition = Math.max(0, f(params, "transition_cost"));
+  }
 
-  const [blackApps, platinumApps, blackRevenue, platinumRevenue, cardRevenue] = cardOriginations(params, traffic);
-  const gross = promoRevenue + cardRevenue + extraProductRevenue;
+  const [blackApps, platinumApps, blackRevenue, platinumRevenue, cardRevenue] = cardOriginations(
+    params, traffic, month, phase, statusQuo,
+  );
+  const gross = promoRevenue + cardRevenue + extraProductRevenue + onsiteAds;
   const contractorCost = promoRevenue * contractorPct;
 
   const [opsSalaries, teamHeadcount, teamAvgSalary] = teamForMonth(params, month, phase, statusQuo);
@@ -323,11 +485,14 @@ function monthRow(month, params, statusQuo) {
     rndAvgSalary = 0;
     rndNames = [];
     extraProductRevenue = 0;
+    onsiteAds = 0;
+    distCost = 0;
+    transition = 0;
     salaries = opsSalaries;
   }
 
   const fixed = salaries + support + devCost;
-  const totalCosts = fixed + variable + contractorCost + adsCost;
+  const totalCosts = fixed + variable + contractorCost + adsCost + distCost + transition;
   const cashFlow = gross - totalCosts;
   const teamTotal = teamHeadcount + rndHeadcount;
 
@@ -359,6 +524,7 @@ function monthRow(month, params, statusQuo) {
     organic_promo_revenue: orgPromo,
     ads_promo_revenue: adsPromo,
     extra_product_revenue: extraProductRevenue,
+    onsite_ad_revenue: onsiteAds,
     black_revenue: blackRevenue,
     platinum_revenue: platinumRevenue,
     card_revenue: cardRevenue,
@@ -377,6 +543,8 @@ function monthRow(month, params, statusQuo) {
     extra_rnd_salaries: rndSalaries,
     dev_cost: devCost,
     ads_cost: adsCost,
+    distribution_cost: distCost,
+    transition_cost: transition,
     support,
     variable_costs: variable,
     variable_breakdown: vcBreakdown,
@@ -386,6 +554,12 @@ function monthRow(month, params, statusQuo) {
     lift_traffic: effects.traffic,
     lift_conversion: effects.conversion,
     lift_paid: effects.paid,
+    tid_factor: tid.factor,
+    tid_repeat_traffic: tid.repeatTraffic,
+    tid_conv_factor: tid.convFactor,
+    tid_card_factor: tid.cardFactor,
+    coverage,
+    monetization,
   };
 }
 
@@ -396,19 +570,27 @@ function firstNonneg(rows, field) {
   return null;
 }
 
+function normalizeScenarioName(params) {
+  const raw = String(params.scenario || SCENARIO_BASE).trim().toLowerCase();
+  if (raw === SCENARIO_STRETCH) return SCENARIO_STRETCH;
+  if (raw === SCENARIO_PESS) return SCENARIO_PESS;
+  return SCENARIO_BASE;
+}
+
 export function runModel(inputParams) {
   let params = clone(inputParams);
   const numMonths = Math.max(1, i(params, "num_months", 24));
   const rndMonths = Math.max(0, Math.min(i(params, "rnd_months"), numMonths));
   params.rnd_months = rndMonths;
   params.num_months = numMonths;
-  if (!isStretch(params)) params.scenario = SCENARIO_BASE;
+  params.scenario = normalizeScenarioName(params);
 
   const project = [];
   const statusQuo = [];
   let cumCf = 0;
   let cumSq = 0;
   let cumInc = 0;
+  let minCumInc = 0;
 
   for (let m = 1; m <= numMonths; m += 1) {
     const p = monthRow(m, params, false);
@@ -417,6 +599,7 @@ export function runModel(inputParams) {
     cumSq += s.cash_flow;
     const inc = p.cash_flow - s.cash_flow;
     cumInc += inc;
+    minCumInc = Math.min(minCumInc, cumInc);
     p.cumulative_cf = cumCf;
     s.cumulative_cf = cumSq;
     p.sq_cash_flow = s.cash_flow;
@@ -432,16 +615,18 @@ export function runModel(inputParams) {
   const ownRows = project.filter((r) => r.phase === PHASE_OWN);
   const rndRows = project.filter((r) => r.phase === PHASE_RND);
   const typicalOwnLaunch = ownRows[0] || null;
-  const typicalOwn = ownRows.find((r) => (r.seo_factor || 1) >= 0.999) || ownRows[ownRows.length - 1] || null;
+  const terminalSeo = seoOrganicFactor(params, rndMonths + Math.max(0, i(params, "seo_recovery_months", 6)) + 1, PHASE_OWN);
+  const typicalOwn = ownRows.find((r) => Math.abs((r.seo_factor || 1) - terminalSeo) < 0.001) || ownRows[ownRows.length - 1] || null;
   const typicalRnd = rndRows[0] || null;
   const typicalSq = statusQuo[0] || null;
 
   let rndInvestment = rndRows.reduce((sum, r) => sum - r.incremental_cf, 0);
   rndInvestment = Math.max(0, rndInvestment);
 
+  const yearIndex = Math.min(11, project.length - 1);
   const sqMonth1 = monthRow(1, params, true);
   const kpis = {
-    scenario: params.scenario || SCENARIO_BASE,
+    scenario: params.scenario,
     num_months: numMonths,
     rnd_months: rndMonths,
     gross_month_base: sqMonth1.gross_revenue,
@@ -459,8 +644,12 @@ export function runModel(inputParams) {
     total_dev_cost: project.reduce((s, r) => s + r.dev_cost, 0),
     total_organic_promo: project.reduce((s, r) => s + r.organic_promo_revenue, 0),
     total_ads_promo: project.reduce((s, r) => s + r.ads_promo_revenue, 0),
+    total_onsite_ads: project.reduce((s, r) => s + (r.onsite_ad_revenue || 0), 0),
+    total_card_revenue: project.reduce((s, r) => s + (r.card_revenue || 0), 0),
     final_cumulative_cf: project[project.length - 1].cumulative_cf,
     final_cumulative_incremental: project[project.length - 1].cumulative_incremental,
+    year_incremental: project[yearIndex].cumulative_incremental,
+    max_need: Math.abs(minCumInc),
     payback_project_month: paybackProject,
     payback_incremental_month: paybackIncremental,
     rnd_investment: rndInvestment,
@@ -489,6 +678,7 @@ export function sensitivityTable(params, deltas = [-0.2, 0, 0.2]) {
     drivers.push(
       ["seo_dip_floor_pct", "SEO-пол после переезда"],
       ["seo_recovery_months", "Срок восстановления SEO, мес."],
+      ["seo_final_pct", "SEO после восстановления"],
     );
   }
   if (isStretch(params) && enabled(params, "ads_enabled", false)) {
@@ -497,6 +687,18 @@ export function sensitivityTable(params, deltas = [-0.2, 0, 0.2]) {
       ["conversion_pct_ads", "Конверсия рекламы"],
       ["paid_partner_share_pct_ads", "Доля оплачиваемых (реклама)"],
       ["ads_cost_month", "Бюджет рекламы / мес"],
+    );
+  }
+  if (isStretch(params) && enabled(params, "tid_enabled", false)) {
+    drivers.push(["tid_auth_share_pct", "T-ID: доля авторизованных"]);
+  }
+  if (isStretch(params) && enabled(params, "onsite_ads_enabled", false)) {
+    drivers.push(["onsite_ad_ecpm", "Onsite eCPM"]);
+  }
+  if (isStretch(params) && enabled(params, "bank_enabled", false)) {
+    drivers.push(
+      ["debit_show_pct", "Black: показ"],
+      ["credit_show_pct", "Platinum: показ"],
     );
   }
   const out = {};
@@ -535,5 +737,40 @@ export function applyBaseConstraints(params) {
   next.own_approved_share_lift_pct = 0;
   next.own_paid_share_lift_pct = 0;
   next.own_arpu_lift_pct = 0;
+  next.tid_enabled = false;
+  next.tid_auth_share_pct = 0;
+  next.tid_repeat_lift_pct = 0;
+  next.tid_cpa_lift_pct = 0;
+  next.tid_card_lift_pct = 0;
+  next.onsite_ads_enabled = false;
+  next.onsite_ad_impressions = 0;
+  next.onsite_ad_fill_pct = 0;
+  next.onsite_ad_ecpm = 0;
+  next.bank_enabled = false;
+  next.debit_show_pct = 0;
+  next.debit_util_pct = 0;
+  next.debit_inc_pct = 0;
+  next.credit_show_pct = 0;
+  next.credit_util_pct = 0;
+  next.credit_inc_pct = 0;
+  next.stretch_extra_traffic = 0;
+  next.distribution_cost = 0;
+  next.coverage_start_pct = 100;
+  next.coverage_target_pct = 100;
+  next.mon_start_pct = 100;
+  next.mon_target_pct = 100;
+  return next;
+}
+
+export function applyPessConstraints(params) {
+  const next = applyBaseConstraints(params);
+  next.scenario = SCENARIO_PESS;
+  return next;
+}
+
+export function applyPessHaircut(params) {
+  const next = applyPessConstraints(params);
+  Object.assign(next, PESS_HAIRCUT);
+  next.dev_cost_month = next.dev_cost_rnd;
   return next;
 }

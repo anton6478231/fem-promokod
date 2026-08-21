@@ -1,7 +1,19 @@
-import { applyBaseConstraints, runModel, sensitivityTable } from "./engine.js?v=20260820-logic";
+import {
+  applyBaseConstraints,
+  applyPessConstraints,
+  applyPessHaircut,
+  runModel,
+  sensitivityTable,
+} from "./engine.js?v=20260821-sync";
+
+const STORAGE_KEY = "fem-promokod-v20260821";
+const BUILD_STAMP = "21.08 sync";
 
 const ORGANIC_COPY_KEYS = [
   "rnd_months", "traffic_month", "seo_dip_enabled", "seo_dip_floor_pct", "seo_recovery_months",
+  "seo_final_pct", "seo_share_pct", "traffic_trend_pct",
+  "coverage_start_pct", "coverage_target_pct", "coverage_ramp_months",
+  "mon_start_pct", "mon_target_pct", "mon_ramp_months", "transition_cost",
   "conversion_pct", "approved_activation_share_pct", "paid_partner_share_pct", "arpu",
   "contractor_share_pct", "contractor_share_rnd", "contractor_share_ops", "contractor_share_status_quo",
   "dev_cost_month", "dev_cost_rnd", "dev_cost_ops", "dev_cost_status_quo",
@@ -13,9 +25,22 @@ const ORGANIC_COPY_KEYS = [
 const TABS = [
   ["base", "Base"],
   ["stretch", "Stretch"],
+  ["pess", "Pess"],
   ["params", "Параметры"],
   ["logic", "Логика"],
 ];
+
+const SCENARIO_TABS = ["base", "stretch", "pess"];
+const SCENARIO_TITLE = {
+  base: "Base — органика без рекламы и зарплат",
+  stretch: "Stretch — доп. RnD + T-ID + onsite + банк",
+  pess: "Pess — тот же Base, чуть хуже сроки и SEO",
+};
+const SCENARIO_CAPTION = {
+  base: "Забираем сайт: N месяцев разработки, дальше только поддержка. Ответ на вопрос: отобьётся ли инвестиция на текущем потоке.",
+  stretch: "Тот же забор сайта, плюс продуктовый RnD, T-ID, реклама на сайте (eCPM) и банковская воронка. Закупка трафика — отдельный канал.",
+  pess: "Формула как у Base (без Stretch-слоёв). Хуже пол SEO, дольше восстановление, финал 90%, дольше RnD и дороже поддержка.",
+};
 
 const KIND_OPTIONS = [
   ["fixed", "фикс ₽/мес"],
@@ -76,7 +101,9 @@ function scenarioParams(name) {
     num_months: state.num_months,
     scenario: name,
   };
-  return name === "base" ? applyBaseConstraints(raw) : raw;
+  if (name === "base") return applyBaseConstraints(raw);
+  if (name === "pess") return applyPessConstraints(raw);
+  return raw;
 }
 
 function stripMeta(src) {
@@ -120,12 +147,48 @@ function normalizeScenario(p) {
 function initState(src) {
   const base = normalizeScenario(stripMeta(src));
   const stretch = normalizeScenario(stripMeta(src));
+  const pess = normalizeScenario(applyPessHaircut(stripMeta(src)));
   return {
     tab: (location.hash.replace("#", "") || "base"),
     num_months: src.num_months,
     base,
     stretch,
+    pess,
   };
+}
+
+function persistState() {
+  if (!state) return;
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      num_months: state.num_months,
+      tab: state.tab,
+      base: state.base,
+      stretch: state.stretch,
+      pess: state.pess,
+    }));
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function restoreState(src) {
+  const fresh = initState(src);
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return fresh;
+    const saved = JSON.parse(raw);
+    const merge = (fallback, extra) => normalizeScenario({ ...fallback, ...(extra || {}) });
+    return {
+      tab: saved.tab || fresh.tab,
+      num_months: saved.num_months || fresh.num_months,
+      base: merge(fresh.base, saved.base),
+      stretch: merge(fresh.stretch, saved.stretch),
+      pess: merge(fresh.pess, saved.pess),
+    };
+  } catch {
+    return fresh;
+  }
 }
 
 function field(sc, key, label, opts = {}) {
@@ -157,10 +220,12 @@ function arrField(sc, arr, i, key, label, opts = {}) {
 
 function formBlocks(sc, { full = false } = {}) {
   const stretch = sc === "stretch";
+  const pess = sc === "pess";
   const ads = stretch ? `
     <div class="block">
-      <h3>Реклама</h3>
-      ${field(sc, "ads_enabled", "Включить рекламу", { check: true })}
+      <h3>Реклама — закупка трафика</h3>
+      <p class="hint">Платный канал визитов. Это не реклама на сайте (eCPM ниже).</p>
+      ${field(sc, "ads_enabled", "Включить закупку", { check: true })}
       <div class="row">
         ${field(sc, "ads_start_month", "Старт, месяц")}
         ${field(sc, "ads_end_month", "Конец (0 = до горизонта)")}
@@ -170,6 +235,57 @@ function formBlocks(sc, { full = false } = {}) {
       ${field(sc, "conversion_pct_ads", "CR рекламы, %", { step: 0.1 })}
       ${field(sc, "approved_activation_share_pct_ads", "Одобренные, %", { step: 0.1 })}
       ${field(sc, "paid_partner_share_pct_ads", "Оплачиваемые, %", { step: 0.1 })}
+    </div>` : "";
+
+  const onsite = stretch ? `
+    <div class="block">
+      <h3>Реклама на сайте (eCPM)</h3>
+      <p class="hint">Доход с инвентаря на своём сайте. Подрядчик не режет. Запуск не раньше первого своего месяца.</p>
+      ${field(sc, "onsite_ads_enabled", "Включить onsite ads", { check: true })}
+      ${field(sc, "onsite_ad_launch", "Запуск, месяц")}
+      <div class="row">
+        ${field(sc, "onsite_ad_impressions", "Показов на визит", { step: 0.1 })}
+        ${field(sc, "onsite_ad_fill_pct", "Fill rate, %", { step: 0.1 })}
+      </div>
+      ${field(sc, "onsite_ad_ecpm", "eCPM, ₽")}
+    </div>` : "";
+
+  const tid = stretch ? `
+    <div class="block">
+      <h3>T-ID</h3>
+      <p class="hint">Доля авторизованных: extra-трафик без SEO-просадки, лифт CR и карт. Ramp линейный с месяца запуска.</p>
+      ${field(sc, "tid_enabled", "Включить T-ID", { check: true })}
+      <div class="row">
+        ${field(sc, "tid_launch", "Запуск, месяц")}
+        ${field(sc, "tid_ramp_months", "Ramp, мес.")}
+      </div>
+      ${field(sc, "tid_auth_share_pct", "Доля авторизованных, %", { step: 0.1 })}
+      <div class="row">
+        ${field(sc, "tid_repeat_lift_pct", "Repeat, %", { step: 0.1 })}
+        ${field(sc, "tid_cpa_lift_pct", "Лифт CPA, %", { step: 0.1 })}
+      </div>
+      ${field(sc, "tid_card_lift_pct", "Лифт карт, %", { step: 0.1 })}
+    </div>` : "";
+
+  const bank = stretch ? `
+    <div class="block">
+      <h3>Банковские продукты</h3>
+      <p class="hint">Stretch: show × util × incrementality × LTV × ramp × T-ID. Base/Pess остаются на доле трафика (сейчас 0%).</p>
+      ${field(sc, "bank_enabled", "Включить банковскую воронку", { check: true })}
+      <div class="row">
+        ${field(sc, "bank_launch", "Запуск, месяц")}
+        ${field(sc, "bank_ramp_months", "Ramp, мес.")}
+      </div>
+      <div class="row">
+        ${field(sc, "debit_show_pct", "Black показ, %", { step: 0.1 })}
+        ${field(sc, "debit_util_pct", "Black util, %", { step: 0.01 })}
+      </div>
+      ${field(sc, "debit_inc_pct", "Black инкрементальность, %", { step: 0.1 })}
+      <div class="row">
+        ${field(sc, "credit_show_pct", "Platinum показ, %", { step: 0.1 })}
+        ${field(sc, "credit_util_pct", "Platinum util, %", { step: 0.01 })}
+      </div>
+      ${field(sc, "credit_inc_pct", "Platinum инкрементальность, %", { step: 0.1 })}
     </div>` : "";
 
   const rnd = stretch ? `
@@ -199,6 +315,15 @@ function formBlocks(sc, { full = false } = {}) {
         ${field(sc, "own_paid_share_lift_pct", "Оплачиваемые, %")}
         ${field(sc, "own_arpu_lift_pct", "ARPU, %")}
       </div>
+    </div>
+    <div class="block">
+      <h3>Доп. дистрибуция</h3>
+      <p class="hint">Опциональный extra-трафик и его стоимость с указанного месяца. По умолчанию 0.</p>
+      <div class="row">
+        ${field(sc, "distribution_launch", "Запуск, месяц")}
+        ${field(sc, "stretch_extra_traffic", "Визиты / мес")}
+      </div>
+      ${field(sc, "distribution_cost", "Стоимость, ₽/мес")}
     </div>` : "";
 
   return `
@@ -206,10 +331,13 @@ function formBlocks(sc, { full = false } = {}) {
       <h3>Горизонт и разработка</h3>
       ${field(sc, "num_months", "Горизонт, мес.")}
       ${field(sc, "rnd_months", "Разработка сайта, мес.")}
+      ${field(sc, "transition_cost", "Переход в месяц запуска, ₽")}
     </div>
     <div class="block">
       <h3>Органика</h3>
       ${field(sc, "traffic_month", "Визиты / мес")}
+      ${field(sc, "seo_share_pct", "Доля SEO в органике, %", { step: 0.1 })}
+      ${field(sc, "traffic_trend_pct", "Тренд трафика, %/год", { step: 0.1 })}
       ${field(sc, "conversion_pct", "Конверсия в активацию, %", { step: 0.1 })}
       ${field(sc, "approved_activation_share_pct", "Доля одобренных, %", { step: 0.1 })}
       ${field(sc, "paid_partner_share_pct", "Доля оплачиваемых, %", { step: 0.1 })}
@@ -222,8 +350,11 @@ function formBlocks(sc, { full = false } = {}) {
         ${field(sc, "seo_dip_floor_pct", "Пол в первый свой месяц, %")}
         ${field(sc, "seo_recovery_months", "Восстановление, мес.")}
       </div>
+      ${field(sc, "seo_final_pct", "SEO после восстановления, %")}
     </div>
     ${ads}
+    ${onsite}
+    ${tid}
     <div class="block">
       <h3>Карты</h3>
       ${field(sc, "card_black_enabled", "Учитывать Black", { check: true })}
@@ -237,6 +368,7 @@ function formBlocks(sc, { full = false } = {}) {
         ${field(sc, "platinum_ltv", "LTV Platinum, ₽")}
       </div>
     </div>
+    ${bank}
     ${rnd}
     <div class="block">
       <h3>Затраты по фазам</h3>
@@ -251,7 +383,8 @@ function formBlocks(sc, { full = false } = {}) {
       ${vcEditor(sc)}
     </div>
     ${stretch && !full ? "" : ""}
-    ${sc === "base" ? `<p class="hint">В Base зарплаты, реклама и лифты принудительно = 0: вкладка отвечает, отобьётся ли забор на текущей органике.</p>` : ""}
+    ${sc === "base" ? `<p class="hint">В Base зарплаты, реклама, T-ID, onsite и банк принудительно = 0: вкладка отвечает, отобьётся ли забор на текущей органике.</p>` : ""}
+    ${pess ? `<p class="hint">Pess — тот же продукт, что Base. По умолчанию: SEO-пол 70%, восстановление 9 мес., финал 90%, RnD 4 мес., разработка 2.2 млн/мес, поддержка своего сайта 80k.</p>` : ""}
   `;
 }
 
@@ -325,6 +458,7 @@ function monthCostLines(row, extraNames = []) {
     ["Выручка (валовая)", row.gross_revenue || 0],
     ["  промо органика", row.organic_promo_revenue || 0],
     ["  промо реклама", row.ads_promo_revenue || 0],
+    ["  onsite ads", row.onsite_ad_revenue || 0],
     ["  карты", row.card_revenue || 0],
     ["  доп. выручка RnD", row.extra_product_revenue || 0],
     ["Доля подрядчика", -(row.contractor_cost || 0)],
@@ -333,6 +467,8 @@ function monthCostLines(row, extraNames = []) {
     ["ЗП сопровождения", -(row.ops_salaries || 0)],
     ["ЗП доп. RnD", -(row.extra_rnd_salaries || 0)],
     ["Реклама", -(row.ads_cost || 0)],
+    ["Дистрибуция", -(row.distribution_cost || 0)],
+    ["Переход", -(row.transition_cost || 0)],
   ];
   const breakdown = { ...(row.variable_breakdown || {}) };
   for (const name of extraNames) if (name && !(name in breakdown)) breakdown[name] = 0;
@@ -369,9 +505,11 @@ function renderTypical(kpis, scenario) {
         .map(([n, v]) => `<li>${n}: ${rub(v)}</li>`).join("");
       const stretchBits = scenario === "stretch"
         ? `<li>промо реклама: ${rub(row.ads_promo_revenue || 0)}</li>
+           <li>onsite ads: ${rub(row.onsite_ad_revenue || 0)}</li>
+           <li>T-ID repeat: ${nf.format(Math.round(row.tid_repeat_traffic || 0))}</li>
            <li>ЗП сопровождения: ${rub(row.ops_salaries || 0)}</li>
            <li>ЗП доп. RnD: ${rub(row.extra_rnd_salaries || 0)}</li>
-           <li>реклама: ${rub(row.ads_cost || 0)}</li>`
+           <li>реклама (закупка): ${rub(row.ads_cost || 0)}</li>`
         : "";
       return `<div class="phase"><h4>${title}</h4><ul>
         <li>Органика: ${nf.format(Math.round(row.organic_traffic || 0))} (SEO ${seo.toFixed(0)}%)</li>
@@ -415,20 +553,44 @@ function renderOpex(kpis, params) {
 function renderComparison(current) {
   const base = runModel(scenarioParams("base")).kpis;
   const stretch = runModel(scenarioParams("stretch")).kpis;
+  const pess = runModel(scenarioParams("pess")).kpis;
   const pay = (m) => (m ? `${m} мес.` : "нет");
   const rows = [
-    ["Окупаемость vs подрядчик", pay(base.payback_incremental_month), pay(stretch.payback_incremental_month)],
-    [`Инкремент за ${base.num_months} мес.`, rub(base.final_cumulative_incremental), rub(stretch.final_cumulative_incremental)],
-    ["CF проекта", rub(base.total_cf), rub(stretch.total_cf)],
-    ["Выручка", rub(base.total_gross), rub(stretch.total_gross)],
-    ["Затраты", rub(base.total_costs), rub(stretch.total_costs)],
-    ["ЗП доп. RnD", "—", rub(stretch.total_extra_rnd_salaries || 0)],
-    ["Реклама", "—", rub(stretch.total_ads_cost || 0)],
+    ["Окупаемость vs подрядчик", pay(base.payback_incremental_month), pay(stretch.payback_incremental_month), pay(pess.payback_incremental_month)],
+    [`Инкремент за ${base.num_months} мес.`, rub(base.final_cumulative_incremental), rub(stretch.final_cumulative_incremental), rub(pess.final_cumulative_incremental)],
+    ["Эффект за 12 мес.", rub(base.year_incremental), rub(stretch.year_incremental), rub(pess.year_incremental)],
+    ["Макс. просадка vs подрядчик", rub(base.max_need), rub(stretch.max_need), rub(pess.max_need)],
+    ["CF проекта", rub(base.total_cf), rub(stretch.total_cf), rub(pess.total_cf)],
+    ["Выручка", rub(base.total_gross), rub(stretch.total_gross), rub(pess.total_gross)],
+    ["Затраты", rub(base.total_costs), rub(stretch.total_costs), rub(pess.total_costs)],
+    ["Onsite ads", "—", rub(stretch.total_onsite_ads || 0), "—"],
+    ["Карты / банк", rub(base.total_card_revenue || 0), rub(stretch.total_card_revenue || 0), rub(pess.total_card_revenue || 0)],
+    ["ЗП доп. RnD", "—", rub(stretch.total_extra_rnd_salaries || 0), "—"],
+    ["Реклама (закупка)", "—", rub(stretch.total_ads_cost || 0), "—"],
   ];
-  return `<div class="panel card-pad"><h2>Base vs Stretch</h2>
-    <p class="caption">Сейчас открыт <b>${current}</b>.</p>
-    <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Base</th><th>Stretch</th></tr></thead>
-    <tbody>${rows.map((r) => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td></tr>`).join("")}</tbody></table></div></div>`;
+  return `<div class="panel card-pad"><h2>Base vs Stretch vs Pess</h2>
+    <p class="caption">Сейчас открыт <b>${current}</b>. Инкремент — к статус-кво подрядчика.</p>
+    <div class="table-wrap"><table><thead><tr><th>Метрика</th><th>Base</th><th>Stretch</th><th>Pess</th></tr></thead>
+    <tbody>${rows.map((r) => `<tr><td>${r[0]}</td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td></tr>`).join("")}</tbody></table></div></div>`;
+}
+
+function renderOverlayChart() {
+  const base = runModel(scenarioParams("base"));
+  const stretch = runModel(scenarioParams("stretch"));
+  const pess = runModel(scenarioParams("pess"));
+  const n = Math.max(base.project.length, stretch.project.length, pess.project.length);
+  const labels = Array.from({ length: n }, (_, i) => `М${i + 1}`);
+  return svgChart({
+    title: "Накопленный инкремент: Base / Stretch / Pess",
+    labels,
+    yFormat: compact,
+    yKind: "money",
+    series: [
+      { name: "Base", color: "#3B82F6", width: 2, values: base.project.map((r) => r.cumulative_incremental) },
+      { name: "Stretch", color: "#059669", width: 3, values: stretch.project.map((r) => r.cumulative_incremental) },
+      { name: "Pess", color: "#EF4444", width: 2, dash: "5 4", values: pess.project.map((r) => r.cumulative_incremental) },
+    ],
+  });
 }
 
 function monthLabels(project) {
@@ -575,9 +737,10 @@ function renderOtherCharts(project, scenario, payback) {
         yKind: "money",
         series: [
           { name: "Промо органика", color: "#059669", values: project.map((r) => r.organic_promo_revenue || 0) },
-          { name: "Промо реклама", color: "#2563EB", values: project.map((r) => r.ads_promo_revenue || 0) },
-          { name: "Карты", color: "#D97706", values: project.map((r) => r.card_revenue || 0) },
-          { name: "Доп. RnD", color: "#7C3AED", values: project.map((r) => r.extra_product_revenue || 0) },
+          { name: "Промо закупка", color: "#2563EB", values: project.map((r) => r.ads_promo_revenue || 0) },
+          { name: "Onsite ads", color: "#7C3AED", values: project.map((r) => r.onsite_ad_revenue || 0) },
+          { name: "Карты / банк", color: "#D97706", values: project.map((r) => r.card_revenue || 0) },
+          { name: "Доп. RnD", color: "#BE123C", values: project.map((r) => r.extra_product_revenue || 0) },
         ],
       })
     : "";
@@ -598,11 +761,11 @@ function renderSensitivity(params) {
 
 function renderMonthTable(project, scenario) {
   const extraHead = scenario === "stretch"
-    ? "<th>Реклама визиты</th><th>Промо реклама</th><th>ЗП RnD</th>"
+    ? "<th>Onsite</th><th>T-ID repeat</th><th>Реклама визиты</th><th>Промо закупка</th><th>ЗП RnD</th>"
     : "";
   const rows = project.map((r) => {
     const extra = scenario === "stretch"
-      ? `<td>${nf.format(Math.round(r.ads_traffic || 0))}</td><td>${rub(r.ads_promo_revenue || 0)}</td><td>${rub(r.extra_rnd_salaries || 0)}</td>`
+      ? `<td>${rub(r.onsite_ad_revenue || 0)}</td><td>${nf.format(Math.round(r.tid_repeat_traffic || 0))}</td><td>${nf.format(Math.round(r.ads_traffic || 0))}</td><td>${rub(r.ads_promo_revenue || 0)}</td><td>${rub(r.extra_rnd_salaries || 0)}</td>`
       : "";
     return `<tr>
       <td>${r.month}</td><td>${r.phase === "rnd" ? "разработка" : "свой сайт"}</td>
@@ -632,42 +795,43 @@ function renderResults(scenario) {
   const stretchKpis = scenario === "stretch"
     ? `<div class="kpis four">
         ${kpiCard(`Промо органика за ${kpis.num_months} мес.`, compact(kpis.total_organic_promo))}
-        ${kpiCard(`Промо с рекламы за ${kpis.num_months} мес.`, compact(kpis.total_ads_promo))}
-        ${kpiCard(`Бюджет рекламы за ${kpis.num_months} мес.`, compact(kpis.total_ads_cost))}
+        ${kpiCard(`Onsite ads за ${kpis.num_months} мес.`, compact(kpis.total_onsite_ads))}
+        ${kpiCard(`Карты / банк за ${kpis.num_months} мес.`, compact(kpis.total_card_revenue))}
         ${kpiCard(`ЗП доп. RnD за ${kpis.num_months} мес.`, compact(kpis.total_extra_rnd_salaries))}
       </div>`
     : "";
-  const title = scenario === "base"
-    ? "Base — органика без рекламы и зарплат"
-    : "Stretch — доп. RnD + реклама";
-  const caption = scenario === "base"
-    ? "Забираем сайт: N месяцев разработки, дальше только поддержка. Ответ на вопрос: отобьётся ли инвестиция на текущем потоке."
-    : "Тот же забор сайта, плюс ручной продуктовый RnD и рекламный канал с отдельной воронкой.";
+  const title = SCENARIO_TITLE[scenario] || scenario;
+  const caption = SCENARIO_CAPTION[scenario] || "";
   const copyBtn = scenario === "stretch"
     ? `<p><button class="ghost" data-copy-organic type="button">Скопировать органику и поддержку из Base</button></p>`
     : "";
+  const resetPess = scenario === "pess"
+    ? `<p><button class="ghost" data-reset-pess type="button">Сбросить пессимистичный от Base</button></p>`
+    : "";
   const seoNote = params.seo_dip_enabled
-    ? ` После переезда органика × SEO-фактор (пол ${params.seo_dip_floor_pct}% , ${params.seo_recovery_months} мес. до 100%).`
+    ? ` После переезда органика × SEO-фактор (пол ${params.seo_dip_floor_pct}% , ${params.seo_recovery_months} мес. до ${params.seo_final_pct ?? 100}%).`
     : "";
   return `
     <div class="panel card-pad">
       <h2 style="text-transform:none;letter-spacing:0;font-size:22px;color:#111">${title}</h2>
       <p class="caption">${caption}</p>
-      ${copyBtn}
+      ${copyBtn}${resetPess}
       <div class="banner">Органика в базе: ${nf.format(params.traffic_month)} × ${params.conversion_pct}% × ${params.approved_activation_share_pct}% × ${params.paid_partner_share_pct}% × ${nf.format(params.arpu)} ₽ = <b>${rub(kpis.promo_revenue_base)} / мес.</b> Итого статус-кво <b>${rub(kpis.gross_month_base)} / мес.</b>${seoNote}</div>
     </div>
-    <div class="kpis">
+    <div class="kpis four">
       ${kpiCard("Срок окупаемости (vs подрядчик)", payback ? `${payback} мес.` : "не окупается", payback ? "достигнут" : `за ${kpis.num_months} мес.`, Boolean(payback))}
       ${kpiCard(`Инкремент за ${kpis.num_months} мес.`, compact(inc), inc >= 0 ? "лучше подрядчика" : "хуже подрядчика", inc >= 0)}
+      ${kpiCard("Макс. просадка vs подрядчик", compact(kpis.max_need))}
       ${kpiCard("Инвестиции на разработке", compact(kpis.rnd_investment))}
     </div>
     <div class="kpis four">
       ${kpiCard(`Выручка за ${kpis.num_months} мес.`, compact(kpis.total_gross))}
       ${kpiCard(`Затраты за ${kpis.num_months} мес.`, compact(kpis.total_costs))}
       ${kpiCard(`CF проекта за ${kpis.num_months} мес.`, compact(kpis.total_cf), kpis.total_cf >= 0 ? "прибыль" : "убыток", kpis.total_cf >= 0)}
-      ${kpiCard("Оплачиваемых активаций / мес", numCompact(kpis.paid_activations_base))}
+      ${kpiCard("Эффект за 12 мес.", compact(kpis.year_incremental))}
     </div>
     ${stretchKpis}
+    ${renderOverlayChart()}
     ${renderCashFlowChart(project)}
     ${renderTypical(kpis, scenario)}
     ${renderOpex(kpis, params)}
@@ -720,19 +884,22 @@ T_ads = ${nf.format(row.ads_traffic || 0)}
 R_promo_ads = ${rub(row.ads_promo_revenue || 0)}
 R_promo = R_promo_org + R_promo_ads = ${rub(row.promo_revenue)}
 
+R_onsite = ${rub(row.onsite_ad_revenue || 0)}
 R_cards = ${rub(row.card_revenue || 0)}
 R_extra = ${rub(row.extra_product_revenue || 0)}
-R = R_promo + R_cards + R_extra = ${rub(row.gross_revenue)}
+R = R_promo + R_cards + R_extra + R_onsite = ${rub(row.gross_revenue)}
 
 подрядчик = R_promo × доля_подрядчика = ${rub(row.contractor_cost)}
 разработка = ${rub(row.dev_cost || 0)}
 поддержка = ${rub(row.support)}
 ЗП сопровождения = ${rub(row.ops_salaries || 0)}
 ЗП доп. RnD = ${rub(row.extra_rnd_salaries || 0)}
-реклама = ${rub(row.ads_cost || 0)}
+реклама (закупка) = ${rub(row.ads_cost || 0)}
+дистрибуция = ${rub(row.distribution_cost || 0)}
+переход = ${rub(row.transition_cost || 0)}
 переменные = ${rub(row.variable_costs || 0)}${vc ? `\n${vc}` : ""}
 
-затраты = ЗП + поддержка + разработка + переменные + подрядчик + реклама
+затраты = ЗП + поддержка + разработка + переменные + подрядчик + реклама + дистрибуция + переход
         = ${rub(row.total_costs)}
 CF = R − затраты = ${rub(row.cash_flow)}</pre>`;
 }
@@ -740,10 +907,13 @@ CF = R − затраты = ${rub(row.cash_flow)}</pre>`;
 function renderLogic() {
   const base = scenarioParams("base");
   const stretch = scenarioParams("stretch");
+  const pess = scenarioParams("pess");
   const baseRun = runModel(base);
   const stretchRun = runModel(stretch);
+  const pessRun = runModel(pess);
   const b = baseRun.kpis;
   const s = stretchRun.kpis;
+  const p = pessRun.kpis;
   const recovery = Math.max(0, Math.trunc(base.seo_recovery_months || 0));
   const seoOwn = baseRun.project.filter((r) => r.phase === "own").slice(0, recovery + 2);
   const vcItems = (base.variable_costs || []).filter((x) => String(x.name || "").trim());
@@ -786,11 +956,12 @@ function renderLogic() {
 
   return `<div class="panel card-pad logic">
     <h2>Логика модели</h2>
-    <p>Ниже — порядок расчёта, как в движке. Два независимых прогона параметров: Base и Stretch. Каждый месяц считается дважды: проект и статус-кво.</p>
+    <p>Ниже — порядок расчёта, как в движке. Три независимых прогона: Base, Stretch и Pess. Каждый месяц считается дважды: проект и статус-кво.</p>
 
     <h3>1. Горизонт</h3>
     <pre class="formula">N = max(1, trunc(num_months))           сейчас ${b.num_months}
-RnD_мес = min(max(0, trunc(rnd_months)), N)  сейчас Base ${b.rnd_months}, Stretch ${s.rnd_months}
+RnD_мес = min(max(0, trunc(rnd_months)), N)
+  Base ${b.rnd_months}, Stretch ${s.rnd_months}, Pess ${p.rnd_months}
 t = 1 … N</pre>
 
     <h3>2. Фаза месяца t</h3>
@@ -799,36 +970,29 @@ t = 1 … N</pre>
 иначе:                             phase = own</pre>
     <p>Статус-кво каждый месяц считается как будто сайт так и остался у подрядчика: без разработки, без SEO-просадки, без рекламы, без доп. RnD, без лифтов.</p>
 
-    <h3>3. Что обнуляет вкладка Base</h3>
-    <pre class="formula">scenario = base
-extra_rnd = []
-team_schedule = []
-ads_enabled = false
-ads_traffic_month = 0
-ads_cost_month = 0
-team_headcount_rnd = 0
-team_headcount_ops = 0
-salaries_rnd = 0
-salaries_ops = 0
-own_*_lift_pct = 0</pre>
-    <p>Поэтому в Base нет рекламы, зарплат команды, доп. RnD и лифтов. Stretch эти поля не трогает.</p>
+    <h3>3. Что обнуляют вкладки Base и Pess</h3>
+    <pre class="formula">extra_rnd = [], ads = 0, зарплаты команды = 0, own_*_lift = 0
+tid_enabled = false, onsite_ads = false, bank_enabled = false
+stretch_extra_traffic = 0, coverage/monetization = 100%</pre>
+    <p>Pess — тот же продукт, что Base, но хуже входы: SEO-пол ${nf1.format(pess.seo_dip_floor_pct)}%, recovery ${pess.seo_recovery_months} мес., финал ${nf1.format(pess.seo_final_pct)}%, RnD ${p.rnd_months} мес. Stretch эти поля не трогает.</p>
 
     <h3>4. SEO-фактор органики</h3>
     <pre class="formula">если phase ∈ {status_quo, rnd} или seo_dip_enabled = нет:
     SEO = 1
 
 floor = min(max(seo_dip_floor_pct / 100, 0), 1)     сейчас ${ratePct((base.seo_dip_floor_pct || 0) / 100)}
+final = min(max(seo_final_pct / 100, 0), 1)         сейчас ${ratePct((base.seo_final_pct ?? 100) / 100)}
 recovery = max(0, trunc(seo_recovery_months))     сейчас ${recovery}
 elapsed = t − RnD_мес                             номер месяца на своём сайте
 
 elapsed ≤ 0            → SEO = 1
 recovery ≤ 0           → SEO = floor
-elapsed > recovery     → SEO = 1
+elapsed > recovery     → SEO = final
 recovery = 1           → SEO = floor
 иначе:
     progress = (elapsed − 1) / (recovery − 1)
-    SEO = floor + (1 − floor) × progress</pre>
-    <p>Реклама и статус-кво SEO не умножают. Первый свой месяц (elapsed = 1) всегда даёт SEO = floor. К 100% линейно приходит на месяце elapsed = recovery.</p>
+    SEO = floor + (final − floor) × progress</pre>
+    <p>Реклама и статус-кво SEO не умножают. При final = 100% формула совпадает со старой (возврат к 1). Pess по умолчанию идёт к ${ratePct((pess.seo_final_pct || 90) / 100)}.</p>
     ${seoOwn.length ? `<div class="table-wrap logic-table"><table><thead><tr><th>Месяц проекта</th><th>elapsed</th><th>SEO</th><th>T_org</th></tr></thead><tbody>
       ${seoOwn.map((r) => `<tr><td>M${r.month}</td><td>${r.month - b.rnd_months}</td><td>${ratePct(r.seo_factor)}</td><td>${nf.format(r.organic_traffic)}</td></tr>`).join("")}
     </tbody></table></div>` : ""}
@@ -892,21 +1056,34 @@ R_promo_org = оплаченные_org × ARPU</pre>
   R_promo_ads = T_ads × CR_ads × S_approved_ads × S_paid_ads × ARPU_ads</pre>
     <p>Сейчас Stretch: ${stretch.ads_enabled ? "включена" : "выключена"}, окно ${adsWindow}, T_ads = ${nf.format(stretch.ads_traffic_month || 0)}, бюджет = ${rub(stretch.ads_cost_month || 0)}, CR = ${nf1.format(stretch.conversion_pct_ads || 0)}%, одобренные = ${nf1.format(stretch.approved_activation_share_pct_ads || 0)}%, оплачиваемые = ${nf1.format(stretch.paid_partner_share_pct_ads || 0)}%.</p>
 
-    <h3>8. Карты</h3>
-    <pre class="formula">T = T_org + T_ads
+    <h3>8. T-ID (только Stretch, phase = own)</h3>
+    <pre class="formula">launch = max(RnD_мес+1, tid_launch)
+tidFactor = clamp((t − launch + 1) / tid_ramp, 0, 1)   если t ≥ launch и tid_enabled
+auth = tid_auth_share_pct / 100
+T_tid = traffic_month × auth × (tid_repeat_lift_pct / 100) × tidFactor     без SEO-просадки
+L_cr *= 1 + auth × (tid_cpa_lift_pct / 100) × tidFactor
+карты *= 1 + auth × (tid_card_lift_pct / 100) × tidFactor</pre>
+    <p>Сейчас Stretch: ${stretch.tid_enabled ? "вкл" : "выкл"}, auth ${nf1.format(stretch.tid_auth_share_pct || 0)}%, repeat ${nf1.format(stretch.tid_repeat_lift_pct || 0)}%, CPA ${nf1.format(stretch.tid_cpa_lift_pct || 0)}%, карты ${nf1.format(stretch.tid_card_lift_pct || 0)}%, запуск М${stretch.tid_launch || 4}.</p>
 
-S_black = card_black_enabled ? min(max(black_share_pct / 100, 0), 1) : 0
-S_plat  = card_platinum_enabled ? min(max(platinum_share_pct / 100, 0), 1) : 0
+    <h3>9. Onsite ads eCPM (только Stretch, свой сайт)</h3>
+    <pre class="formula">R_onsite = T × impressions × (fill/100) × eCPM / 1000
+подрядчик onsite не режет</pre>
+    <p>Сейчас Stretch: ${stretch.onsite_ads_enabled ? "вкл" : "выкл"}, ${nf1.format(stretch.onsite_ad_impressions || 0)} показа, fill ${nf1.format(stretch.onsite_ad_fill_pct || 0)}%, eCPM ${rub(stretch.onsite_ad_ecpm || 0)}, за горизонт ${rub(s.total_onsite_ads)}.</p>
 
-R_black = T × S_black × max(0, black_ltv)
-R_plat  = T × S_plat  × max(0, platinum_ltv)
-R_cards = R_black + R_plat</pre>
-    <p>LTV целиком в месяц оформления. Доля подрядчика на карты не режется. Сейчас доли ${nf1.format(base.black_share_pct || 0)}% Black и ${nf1.format(base.platinum_share_pct || 0)}% Platinum, LTV ${rub(base.black_ltv)} и ${rub(base.platinum_ltv)}.</p>
+    <h3>10. Карты / банк</h3>
+    <pre class="formula">Base и Pess:
+  R_black = T × (black_share_pct/100) × LTV_black     доли сейчас 0%
 
-    <h3>9. Валовая выручка</h3>
+Stretch при bank_enabled:
+  bankFactor = clamp((t − bank_launch + 1) / bank_ramp, 0, 1)
+  R_black = T × show × util × incrementality × LTV × bankFactor × tidCard
+  R_plat  — то же для Platinum</pre>
+    <p>LTV целиком в месяц оформления. Подрядчик карты не режет. Stretch за горизонт ${rub(s.total_card_revenue)}.</p>
+
+    <h3>11. Валовая выручка</h3>
     <pre class="formula">R_promo = R_promo_org + R_promo_ads
 R_extra = 0 в статус-кво, иначе сумма extra_revenue_month сработавших инициатив
-R = R_promo + R_cards + R_extra</pre>
+R = R_promo + R_cards + R_extra + R_onsite</pre>
 
     <h3>10. Доля подрядчика</h3>
     <pre class="formula">pct(phase):
@@ -915,7 +1092,7 @@ R = R_promo + R_cards + R_extra</pre>
   own        → contractor_share_ops          иначе 0
 
 подрядчик = R_promo × pct / 100</pre>
-    <p>Режется только промо, не карты и не R_extra. Сейчас Base: RnD ${nf1.format(base.contractor_share_rnd ?? base.contractor_share_pct)}%, свой сайт ${nf1.format(base.contractor_share_ops || 0)}%, статус-кво ${nf1.format(base.contractor_share_status_quo ?? base.contractor_share_pct)}%.</p>
+    <p>Режется только промо, не карты, не onsite и не R_extra. Сейчас Base: RnD ${nf1.format(base.contractor_share_rnd ?? base.contractor_share_pct)}%, свой сайт ${nf1.format(base.contractor_share_ops || 0)}%, статус-кво ${nf1.format(base.contractor_share_status_quo ?? base.contractor_share_pct)}%.</p>
 
     <h3>11. Разработка и поддержка</h3>
     <pre class="formula">разработка(phase) = max(0, ₽/мес этой фазы)
@@ -978,25 +1155,27 @@ CF_t = R − затраты</pre>
 
 инвестиции на разработке = max(0, − сумма Inc_t по месяцам phase = rnd)</pre>
     <p>Сейчас Base: окупаемость vs подрядчик ${b.payback_incremental_month ? `${b.payback_incremental_month} мес.` : "нет"}, накопленный Inc = ${rub(b.final_cumulative_incremental)}, CF проекта = ${rub(b.total_cf)}, инвестиции RnD = ${rub(b.rnd_investment)}.</p>
-    <p>Stretch: окупаемость vs подрядчик ${s.payback_incremental_month ? `${s.payback_incremental_month} мес.` : "нет"}, накопленный Inc = ${rub(s.final_cumulative_incremental)}, CF проекта = ${rub(s.total_cf)}.</p>
+    <p>Stretch: окупаемость vs подрядчик ${s.payback_incremental_month ? `${s.payback_incremental_month} мес.` : "нет"}, накопленный Inc = ${rub(s.final_cumulative_incremental)}, CF проекта = ${rub(s.total_cf)}, onsite = ${rub(s.total_onsite_ads)}, карты = ${rub(s.total_card_revenue)}.</p>
+    <p>Pess: окупаемость vs подрядчик ${p.payback_incremental_month ? `${p.payback_incremental_month} мес.` : "нет"}, накопленный Inc = ${rub(p.final_cumulative_incremental)}, CF проекта = ${rub(p.total_cf)}.</p>
 
     <h3>16. Суммы за горизонт</h3>
     <pre class="formula">выручка за N мес. = сумма R
 затраты за N мес. = сумма затраты
 CF проекта        = сумма CF_проект
 промо органика    = сумма R_promo_org
-промо реклама     = сумма R_promo_ads
-бюджет рекламы    = сумма ads_cost
-ЗП доп. RnD       = сумма ЗП доп. RnD</pre>
+onsite ads        = сумма R_onsite
+карты / банк      = сумма R_cards
+max_need          = |min(0, накопленный Inc)|
+year_incremental  = накопленный Inc на месяце 12</pre>
 
     <h3>17. Чувствительность</h3>
-    <p>Для каждого драйвера (трафик, CR, одобренные, оплачиваемые, ARPU, доли и LTV карт; если SEO включён — пол и recovery; в Stretch при рекламе — T_ads, CR_ads, paid_ads, бюджет) параметр умножается на 0,8 / 1,0 / 1,2. Пересчитывается вся модель. В таблице — итоговый Inc и окупаемость vs подрядчик.</p>
+    <p>Для каждого драйвера параметр умножается на 0,8 / 1,0 / 1,2. В Stretch дополнительно: T-ID auth, eCPM, показ Black/Platinum. В таблице — итоговый Inc и окупаемость vs подрядчик.</p>
 
     <h3>18. Как выбирается «типовой месяц» на вкладках</h3>
     <pre class="formula">статус-кво     = первый месяц ряда статус-кво
 RnD            = первый месяц phase = rnd
 первый свой    = первый месяц phase = own
-свой после SEO = первый own, где SEO ≥ 0,999; иначе последний own</pre>
+свой после SEO = первый own, где SEO ≈ финальному значению; иначе последний own</pre>
 
     ${walkMonth("Пример: статус-кво, Base", b.typical_sq)}
     ${walkMonth("Пример: RnD, Base", b.typical_rnd)}
@@ -1011,7 +1190,7 @@ function shell() {
   return `
     <header class="top">
       <h1>ФЭМ <span>промокодов</span></h1>
-      <span style="color:#9ca3af;font-size:12px">база ${nf.format(state.base.traffic_month)} визитов · LTV Black ${nf.format(state.base.black_ltv)} ₽ · сборка 20.08 19:30</span>
+      <span style="color:#9ca3af;font-size:12px">база ${nf.format(state.base.traffic_month)} визитов · LTV Black ${nf.format(state.base.black_ltv)} ₽ · сборка ${BUILD_STAMP}</span>
       <nav class="tabs">${TABS.map(([id, label]) => `<button data-tab="${id}" class="${state.tab === id ? "active" : ""}">${label}</button>`).join("")}</nav>
     </header>
     <div id="workspace"></div>
@@ -1031,15 +1210,21 @@ function renderWorkspace() {
         <div class="tabs" style="margin:0 0 12px;justify-content:flex-start">
           <button data-param-sc="base" class="${paramScenario === "base" ? "active" : ""}" style="color:#111;border:1px solid #e5e7eb">Base</button>
           <button data-param-sc="stretch" class="${paramScenario === "stretch" ? "active" : ""}" style="color:#111;border:1px solid #e5e7eb">Stretch</button>
+          <button data-param-sc="pess" class="${paramScenario === "pess" ? "active" : ""}" style="color:#111;border:1px solid #e5e7eb">Pess</button>
         </div>
         ${formBlocks(paramScenario, { full: true })}
       </div>
     </div>`;
     return;
   }
+  const sideTitle = tab === "base"
+    ? "Base: органика без рекламы и ЗП"
+    : tab === "pess"
+      ? "Pess: Base с худшими входами"
+      : "Stretch: RnD + T-ID + onsite + банк";
   root.innerHTML = `<div class="layout">
     <aside class="panel sidebar">
-      <h2>${tab === "base" ? "Base: органика без рекламы и ЗП" : "Stretch: RnD + реклама"}</h2>
+      <h2>${sideTitle}</h2>
       <p class="caption">Коэффициенты живут в своей вкладке.</p>
       ${formBlocks(tab)}
     </aside>
@@ -1184,6 +1369,7 @@ function bind() {
     if (tabBtn) {
       state.tab = tabBtn.dataset.tab;
       location.hash = state.tab;
+      persistState();
       render();
       return;
     }
@@ -1207,6 +1393,7 @@ function bind() {
         state[sc].variable_costs = state[sc].variable_costs || [];
         state[sc].variable_costs.push({ name: "Новая статья", kind: "fixed", rnd: 0, ops: 0, status_quo: 0 });
       }
+      persistState();
       renderWorkspace();
       return;
     }
@@ -1214,12 +1401,21 @@ function bind() {
     if (del) {
       const sc = del.dataset.sc;
       state[sc][del.dataset.del].splice(Number(del.dataset.i), 1);
+      persistState();
       renderWorkspace();
       return;
     }
     if (e.target.closest("[data-copy-organic]")) {
       for (const key of ORGANIC_COPY_KEYS) state.stretch[key] = state.base[key];
       state.stretch.variable_costs = structuredClone(state.base.variable_costs || []);
+      persistState();
+      renderWorkspace();
+      return;
+    }
+    if (e.target.closest("[data-reset-pess]")) {
+      const next = applyPessHaircut({ ...state.base, num_months: state.num_months });
+      state.pess = normalizeScenario(next);
+      persistState();
       renderWorkspace();
     }
   });
@@ -1240,12 +1436,14 @@ function bind() {
       if (el.dataset.key === "dev_cost_rnd") state[sc].dev_cost_month = state[sc].dev_cost_rnd;
       if (el.dataset.key === "contractor_share_rnd") state[sc].contractor_share_pct = state[sc].contractor_share_rnd;
     }
-    if (el.dataset.k === "kind" && (state.tab === "base" || state.tab === "stretch" || state.tab === "params")) {
+    if (el.dataset.k === "kind" && (SCENARIO_TABS.includes(state.tab) || state.tab === "params")) {
+      persistState();
       renderWorkspace();
       return;
     }
+    persistState();
     const results = document.getElementById("results");
-    if (results && (state.tab === "base" || state.tab === "stretch")) {
+    if (results && SCENARIO_TABS.includes(state.tab)) {
       results.innerHTML = renderResults(state.tab);
     }
   });
@@ -1273,7 +1471,7 @@ function bind() {
 }
 
 function render() {
-  if (!["base", "stretch", "params", "logic"].includes(state.tab)) state.tab = "base";
+  if (![...SCENARIO_TABS, "params", "logic"].includes(state.tab)) state.tab = "base";
   document.getElementById("app").innerHTML = shell();
   renderWorkspace();
 }
@@ -1298,7 +1496,7 @@ async function main() {
   const bust = `t=${Date.now()}`;
   const mod = await import(`${defaultsUrl.href}?${bust}`);
   defaults = mod.default;
-  state = initState(defaults);
+  state = restoreState(defaults);
   if (location.hash.replace("#", "")) state.tab = location.hash.replace("#", "");
   bind();
   render();

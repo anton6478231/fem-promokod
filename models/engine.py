@@ -19,8 +19,9 @@ SEO-просадка (только органика, только свой са�
     Base    — забрать сайт на текущем органическом трафике.
               RnD-месяцы: доля подрядчика + стоимость разработки.
               После запуска: только поддержка (без зарплат, без рекламы, без лифтов).
-    Stretch — Base + доп. продуктовый RnD (зарплаты и лифты после завершения) +
-              рекламный трафик с отдельной воронкой активации + опционально команда.
+    Stretch — Base + доп. продуктовый RnD + T-ID + onsite eCPM + банковская воронка +
+              опционально закупка трафика и команда.
+    Pess    — тот же продукт, что Base, с чуть худшими SEO/сроками/OPEX.
 
 Статус-кво: сайт навсегда у подрядчика (без разработки, без команды, без рекламы).
 Инкрементальный CF = CF проекта − CF статус-кво.
@@ -44,6 +45,16 @@ PHASE_RND = "rnd"
 PHASE_SQ = "status_quo"
 SCENARIO_BASE = "base"
 SCENARIO_STRETCH = "stretch"
+SCENARIO_PESS = "pess"
+
+PESS_HAIRCUT = {
+    "seo_dip_floor_pct": 70.0,
+    "seo_recovery_months": 9,
+    "seo_final_pct": 90.0,
+    "rnd_months": 4,
+    "dev_cost_rnd": 2_200_000.0,
+    "support_ops": 80_000.0,
+}
 
 
 def _f(params: Dict, key: str, default: float = 0.0) -> float:
@@ -71,6 +82,127 @@ def _is_stretch(params: Dict) -> bool:
     return str(params.get("scenario") or SCENARIO_BASE).strip().lower() == SCENARIO_STRETCH
 
 
+def _is_pess(params: Dict) -> bool:
+    return str(params.get("scenario") or SCENARIO_BASE).strip().lower() == SCENARIO_PESS
+
+
+def _clamp01(value: float) -> float:
+    return min(max(value, 0.0), 1.0)
+
+
+def _own_start(params: Dict) -> int:
+    return max(0, _i(params, "rnd_months")) + 1
+
+
+def _clamped_launch(params: Dict, key: str, fallback: int) -> int:
+    return max(_own_start(params), _i(params, key, fallback))
+
+
+def _trend_factor(params: Dict, month: int) -> float:
+    annual = _f(params, "traffic_trend_pct") / 100.0
+    if not annual:
+        return 1.0
+    return (1.0 + annual) ** ((month - 1) / 12.0)
+
+
+def _own_ramp(start_pct: float, target_pct: float, elapsed: int, ramp_months: int) -> float:
+    start = _clamp01(start_pct / 100.0)
+    target = _clamp01(target_pct / 100.0)
+    if elapsed <= 0:
+        return 1.0
+    if start == target:
+        return target
+    if ramp_months <= 0:
+        return target
+    if elapsed >= ramp_months:
+        return target
+    if ramp_months == 1:
+        return start
+    progress = (elapsed - 1) / (ramp_months - 1)
+    return start + (target - start) * progress
+
+
+def _coverage_factor(params: Dict, month: int, phase: str) -> float:
+    if phase in (PHASE_SQ, PHASE_RND):
+        return 1.0
+    elapsed = month - max(0, _i(params, "rnd_months"))
+    return _own_ramp(
+        _f(params, "coverage_start_pct", 100.0),
+        _f(params, "coverage_target_pct", 100.0),
+        elapsed,
+        _i(params, "coverage_ramp_months", 0),
+    )
+
+
+def _monetization_factor(params: Dict, month: int, phase: str) -> float:
+    if phase in (PHASE_SQ, PHASE_RND):
+        return 1.0
+    elapsed = month - max(0, _i(params, "rnd_months"))
+    return _own_ramp(
+        _f(params, "mon_start_pct", 100.0),
+        _f(params, "mon_target_pct", 100.0),
+        elapsed,
+        _i(params, "mon_ramp_months", 0),
+    )
+
+
+def tid_effects(params: Dict, month: int, phase: str, status_quo: bool = False) -> Dict[str, float]:
+    idle = {"factor": 0.0, "repeat_traffic": 0.0, "conv_factor": 1.0, "card_factor": 1.0}
+    if status_quo or not _is_stretch(params) or phase != PHASE_OWN:
+        return idle
+    if not _enabled(params, "tid_enabled", False):
+        return idle
+    launch = _clamped_launch(params, "tid_launch", 4)
+    if month < launch:
+        return idle
+    ramp = max(1, _i(params, "tid_ramp_months", 6))
+    factor = _clamp01((month - launch + 1) / ramp)
+    auth = max(0.0, _f(params, "tid_auth_share_pct") / 100.0)
+    repeat_lift = max(0.0, _f(params, "tid_repeat_lift_pct") / 100.0)
+    cpa_lift = max(0.0, _f(params, "tid_cpa_lift_pct") / 100.0)
+    card_lift = max(0.0, _f(params, "tid_card_lift_pct") / 100.0)
+    return {
+        "factor": factor,
+        "repeat_traffic": max(0.0, _f(params, "traffic_month")) * auth * repeat_lift * factor,
+        "conv_factor": 1.0 + auth * cpa_lift * factor,
+        "card_factor": 1.0 + auth * card_lift * factor,
+    }
+
+
+def _distribution_traffic(params: Dict, month: int, phase: str, status_quo: bool = False) -> float:
+    if status_quo or not _is_stretch(params) or phase != PHASE_OWN:
+        return 0.0
+    launch = _clamped_launch(params, "distribution_launch", 7)
+    if month < launch:
+        return 0.0
+    return max(0.0, _f(params, "stretch_extra_traffic"))
+
+
+def _distribution_cost(params: Dict, month: int, phase: str, status_quo: bool = False) -> float:
+    if status_quo or not _is_stretch(params) or phase != PHASE_OWN:
+        return 0.0
+    launch = _clamped_launch(params, "distribution_launch", 7)
+    if month < launch:
+        return 0.0
+    return max(0.0, _f(params, "distribution_cost"))
+
+
+def onsite_ad_revenue(
+    params: Dict, traffic: float, month: int, phase: str, status_quo: bool = False,
+) -> float:
+    if status_quo or not _is_stretch(params) or phase != PHASE_OWN:
+        return 0.0
+    if not _enabled(params, "onsite_ads_enabled", False):
+        return 0.0
+    launch = _clamped_launch(params, "onsite_ad_launch", 4)
+    if month < launch:
+        return 0.0
+    impressions = max(0.0, _f(params, "onsite_ad_impressions"))
+    fill = _clamp01(_f(params, "onsite_ad_fill_pct") / 100.0)
+    ecpm = max(0.0, _f(params, "onsite_ad_ecpm"))
+    return max(0.0, traffic) * impressions * fill * ecpm / 1000.0
+
+
 def _channel_promo(
     traffic: float,
     conversion: float,
@@ -90,16 +222,59 @@ def _channel_promo(
     return activations, approved, paid, paid * arpu
 
 
-def card_originations(params: Dict, traffic: float) -> Tuple[float, float, float, float, float]:
+def card_originations(
+    params: Dict,
+    traffic: float,
+    month: int = 1,
+    phase: str = PHASE_OWN,
+    status_quo: bool = False,
+) -> Tuple[float, float, float, float, float]:
     """black apps, platinum apps, black revenue, platinum revenue, card revenue."""
-    black_share = _f(params, "black_share_pct") / 100.0 if _enabled(params, "card_black_enabled") else 0.0
-    platinum_share = _f(params, "platinum_share_pct") / 100.0 if _enabled(params, "card_platinum_enabled") else 0.0
-    black_share = min(max(black_share, 0.0), 1.0)
-    platinum_share = min(max(platinum_share, 0.0), 1.0)
+    tid = tid_effects(params, month, phase, status_quo)
+    black_on = _enabled(params, "card_black_enabled")
+    plat_on = _enabled(params, "card_platinum_enabled")
     black_ltv = max(0.0, _f(params, "black_ltv"))
     platinum_ltv = max(0.0, _f(params, "platinum_ltv"))
-    black_apps = traffic * black_share
-    platinum_apps = traffic * platinum_share
+
+    if (
+        _is_stretch(params)
+        and not status_quo
+        and phase == PHASE_OWN
+        and _enabled(params, "bank_enabled", False)
+    ):
+        launch = _clamped_launch(params, "bank_launch", 5)
+        if month < launch:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+        ramp = max(1, _i(params, "bank_ramp_months", 6))
+        bank_factor = _clamp01((month - launch + 1) / ramp)
+        scale = bank_factor * tid["card_factor"]
+        debit_rate = (
+            _clamp01(_f(params, "debit_show_pct") / 100.0)
+            * _clamp01(_f(params, "debit_util_pct") / 100.0)
+            * _clamp01(_f(params, "debit_inc_pct") / 100.0)
+            if black_on
+            else 0.0
+        )
+        credit_rate = (
+            _clamp01(_f(params, "credit_show_pct") / 100.0)
+            * _clamp01(_f(params, "credit_util_pct") / 100.0)
+            * _clamp01(_f(params, "credit_inc_pct") / 100.0)
+            if plat_on
+            else 0.0
+        )
+        black_apps = traffic * debit_rate * scale
+        platinum_apps = traffic * credit_rate * scale
+        black_revenue = black_apps * black_ltv
+        platinum_revenue = platinum_apps * platinum_ltv
+        return black_apps, platinum_apps, black_revenue, platinum_revenue, black_revenue + platinum_revenue
+
+    black_share = _f(params, "black_share_pct") / 100.0 if black_on else 0.0
+    platinum_share = _f(params, "platinum_share_pct") / 100.0 if plat_on else 0.0
+    black_share = _clamp01(black_share)
+    platinum_share = _clamp01(platinum_share)
+    card_scale = tid["card_factor"] if (not status_quo and phase == PHASE_OWN) else 1.0
+    black_apps = traffic * black_share * card_scale
+    platinum_apps = traffic * platinum_share * card_scale
     black_revenue = black_apps * black_ltv
     platinum_revenue = platinum_apps * platinum_ltv
     return black_apps, platinum_apps, black_revenue, platinum_revenue, black_revenue + platinum_revenue
@@ -147,6 +322,7 @@ def seo_organic_factor(params: Dict, month: int, phase: str) -> float:
         return 1.0
 
     floor = min(max(_f(params, "seo_dip_floor_pct", 70.0) / 100.0, 0.0), 1.0)
+    final = min(max(_f(params, "seo_final_pct", 100.0) / 100.0, 0.0), 1.0)
     recovery = max(0, _i(params, "seo_recovery_months", 6))
     rnd_months = max(0, _i(params, "rnd_months"))
     elapsed = month - rnd_months
@@ -155,11 +331,11 @@ def seo_organic_factor(params: Dict, month: int, phase: str) -> float:
     if recovery <= 0:
         return floor
     if elapsed > recovery:
-        return 1.0
+        return final
     if recovery == 1:
         return floor
     progress = (elapsed - 1) / (recovery - 1)
-    return floor + (1.0 - floor) * progress
+    return floor + (final - floor) * progress
 
 
 def product_effects(params: Dict, month: int, phase: str) -> Dict[str, float]:
@@ -198,15 +374,26 @@ def product_effects(params: Dict, month: int, phase: str) -> Dict[str, float]:
     return effects
 
 
-def funnel_rates(params: Dict, phase: str, month: int = 1) -> Tuple[float, float, float, float, float]:
+def funnel_rates(
+    params: Dict, phase: str, month: int = 1, status_quo: bool = False,
+) -> Tuple[float, float, float, float, float]:
     """Органический канал: traffic, conversion, approved, paid [0..1], arpu."""
     effects = product_effects(params, month, phase)
     seo = seo_organic_factor(params, month, phase)
-    traffic = max(0.0, _f(params, "traffic_month") * effects["traffic"] * seo)
-    conversion = min(max(_f(params, "conversion_pct") / 100.0 * effects["conversion"], 0.0), 1.0)
+    tid = tid_effects(params, month, phase, status_quo)
+    coverage = _coverage_factor(params, month, phase)
+    monetization = _monetization_factor(params, month, phase)
+    trend = _trend_factor(params, month)
+    seo_share = _clamp01(_f(params, "seo_share_pct", 100.0) / 100.0)
+    base_organic = max(0.0, _f(params, "traffic_month") * effects["traffic"] * trend)
+    seo_traffic = base_organic * seo_share * seo
+    other_traffic = base_organic * (1.0 - seo_share)
+    extra_traffic = tid["repeat_traffic"] + _distribution_traffic(params, month, phase, status_quo)
+    traffic = seo_traffic + other_traffic + extra_traffic
+    conversion = min(max(_f(params, "conversion_pct") / 100.0 * effects["conversion"] * tid["conv_factor"], 0.0), 1.0)
     approved_share = min(max(_f(params, "approved_activation_share_pct", 100.0) / 100.0 * effects["approved"], 0.0), 1.0)
     paid_share = min(max(_f(params, "paid_partner_share_pct") / 100.0 * effects["paid"], 0.0), 1.0)
-    arpu = max(0.0, _f(params, "arpu") * effects["arpu"])
+    arpu = max(0.0, _f(params, "arpu") * effects["arpu"] * coverage * monetization)
     return traffic, conversion, approved_share, paid_share, arpu
 
 
@@ -224,19 +411,24 @@ def ads_active(params: Dict, month: int, phase: str) -> bool:
     return True
 
 
-def ads_funnel(params: Dict, month: int, phase: str) -> Tuple[float, float, float, float, float, float]:
+def ads_funnel(
+    params: Dict, month: int, phase: str, status_quo: bool = False,
+) -> Tuple[float, float, float, float, float, float]:
     """traffic, conversion, approved, paid, arpu, ads_cost. Нулевые, если реклама выключена."""
     if not ads_active(params, month, phase):
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     effects = product_effects(params, month, phase)
+    tid = tid_effects(params, month, phase, status_quo)
+    coverage = _coverage_factor(params, month, phase)
+    monetization = _monetization_factor(params, month, phase)
     traffic = max(0.0, _f(params, "ads_traffic_month"))
-    conversion = min(max(_f(params, "conversion_pct_ads") / 100.0 * effects["conversion"], 0.0), 1.0)
+    conversion = min(max(_f(params, "conversion_pct_ads") / 100.0 * effects["conversion"] * tid["conv_factor"], 0.0), 1.0)
     approved_share = min(
         max(_f(params, "approved_activation_share_pct_ads", 100.0) / 100.0 * effects["approved"], 0.0),
         1.0,
     )
     paid_share = min(max(_f(params, "paid_partner_share_pct_ads") / 100.0 * effects["paid"], 0.0), 1.0)
-    arpu = max(0.0, _f(params, "arpu") * effects["arpu"])
+    arpu = max(0.0, _f(params, "arpu") * effects["arpu"] * coverage * monetization)
     cost = max(0.0, _f(params, "ads_cost_month"))
     return traffic, conversion, approved_share, paid_share, arpu, cost
 
@@ -341,12 +533,13 @@ def _month_row(month: int, params: Dict, *, status_quo: bool) -> Dict[str, Any]:
 
     effects = product_effects(params, month, phase)
     seo = seo_organic_factor(params, month, phase)
-    org_pre_seo = max(0.0, _f(params, "traffic_month") * effects["traffic"])
+    tid = tid_effects(params, month, phase, status_quo)
+    org_pre_seo = max(0.0, _f(params, "traffic_month") * effects["traffic"] * _trend_factor(params, month))
     org_traffic, org_cr, org_approved, org_paid, org_arpu = funnel_rates(
-        params, phase, month,
+        params, phase, month, status_quo,
     )
     ads_traffic, ads_cr, ads_approved, ads_paid, ads_arpu, ads_cost = ads_funnel(
-        params, month, phase,
+        params, month, phase, status_quo,
     )
 
     org_act, org_appr, org_paid_n, org_promo = _channel_promo(
@@ -362,11 +555,16 @@ def _month_row(month: int, params: Dict, *, status_quo: bool) -> Dict[str, Any]:
     paid_activations = org_paid_n + ads_paid_n
     promo_revenue = org_promo + ads_promo
     extra_product_revenue = 0.0 if status_quo else effects["extra_revenue"]
+    onsite_ads = onsite_ad_revenue(params, traffic, month, phase, status_quo)
+    dist_cost = _distribution_cost(params, month, phase, status_quo)
+    transition = 0.0
+    if not status_quo and month == rnd_months + 1:
+        transition = max(0.0, _f(params, "transition_cost"))
 
     black_apps, platinum_apps, black_revenue, platinum_revenue, card_revenue = card_originations(
-        params, traffic,
+        params, traffic, month, phase, status_quo,
     )
-    gross = promo_revenue + card_revenue + extra_product_revenue
+    gross = promo_revenue + card_revenue + extra_product_revenue + onsite_ads
     contractor_cost = promo_revenue * contractor_pct
 
     ops_salaries, team_headcount, team_avg_salary = _team_for_month(
@@ -392,9 +590,12 @@ def _month_row(month: int, params: Dict, *, status_quo: bool) -> Dict[str, Any]:
         rnd_avg_salary = 0.0
         rnd_names = []
         extra_product_revenue = 0.0
+        onsite_ads = 0.0
+        dist_cost = 0.0
+        transition = 0.0
 
     fixed = salaries + support + dev_cost
-    total_costs = fixed + variable + contractor_cost + ads_cost
+    total_costs = fixed + variable + contractor_cost + ads_cost + dist_cost + transition
     cash_flow = gross - total_costs
 
     return {
@@ -425,6 +626,7 @@ def _month_row(month: int, params: Dict, *, status_quo: bool) -> Dict[str, Any]:
         "organic_promo_revenue": org_promo,
         "ads_promo_revenue": ads_promo,
         "extra_product_revenue": extra_product_revenue,
+        "onsite_ad_revenue": onsite_ads,
         "black_revenue": black_revenue,
         "platinum_revenue": platinum_revenue,
         "card_revenue": card_revenue,
@@ -447,6 +649,8 @@ def _month_row(month: int, params: Dict, *, status_quo: bool) -> Dict[str, Any]:
         "extra_rnd_salaries": rnd_salaries,
         "dev_cost": dev_cost,
         "ads_cost": ads_cost,
+        "distribution_cost": dist_cost,
+        "transition_cost": transition,
         "support": support,
         "variable_costs": variable,
         "variable_breakdown": vc_breakdown,
@@ -456,6 +660,12 @@ def _month_row(month: int, params: Dict, *, status_quo: bool) -> Dict[str, Any]:
         "lift_traffic": effects["traffic"],
         "lift_conversion": effects["conversion"],
         "lift_paid": effects["paid"],
+        "tid_factor": tid["factor"],
+        "tid_repeat_traffic": tid["repeat_traffic"],
+        "tid_conv_factor": tid["conv_factor"],
+        "tid_card_factor": tid["card_factor"],
+        "coverage": _coverage_factor(params, month, phase),
+        "monetization": _monetization_factor(params, month, phase),
     }
 
 
@@ -473,7 +683,12 @@ def run_model(params: Dict[str, Any]) -> Dict[str, Any]:
     params = deepcopy(params)
     params["rnd_months"] = rnd_months
     params["num_months"] = num_months
-    if not _is_stretch(params):
+    scenario = str(params.get("scenario") or SCENARIO_BASE).strip().lower()
+    if scenario == SCENARIO_STRETCH:
+        params["scenario"] = SCENARIO_STRETCH
+    elif scenario == SCENARIO_PESS:
+        params["scenario"] = SCENARIO_PESS
+    else:
         params["scenario"] = SCENARIO_BASE
 
     project: List[Dict[str, Any]] = []
@@ -481,6 +696,7 @@ def run_model(params: Dict[str, Any]) -> Dict[str, Any]:
     cum_cf = 0.0
     cum_sq = 0.0
     cum_inc = 0.0
+    min_cum_inc = 0.0
 
     for m in range(1, num_months + 1):
         p = _month_row(m, params, status_quo=False)
@@ -489,6 +705,7 @@ def run_model(params: Dict[str, Any]) -> Dict[str, Any]:
         cum_sq += s["cash_flow"]
         inc = p["cash_flow"] - s["cash_flow"]
         cum_inc += inc
+        min_cum_inc = min(min_cum_inc, cum_inc)
         p["cumulative_cf"] = cum_cf
         s["cumulative_cf"] = cum_sq
         p["sq_cash_flow"] = s["cash_flow"]
@@ -504,8 +721,11 @@ def run_model(params: Dict[str, Any]) -> Dict[str, Any]:
     own_rows = [r for r in project if r["phase"] == PHASE_OWN]
     rnd_rows = [r for r in project if r["phase"] == PHASE_RND]
     typical_own_launch = own_rows[0] if own_rows else None
+    terminal_seo = seo_organic_factor(
+        params, rnd_months + max(0, _i(params, "seo_recovery_months", 6)) + 1, PHASE_OWN,
+    )
     typical_own = next(
-        (r for r in own_rows if r.get("seo_factor", 1.0) >= 0.999),
+        (r for r in own_rows if abs(r.get("seo_factor", 1.0) - terminal_seo) < 0.001),
         own_rows[-1] if own_rows else None,
     )
     typical_rnd = rnd_rows[0] if rnd_rows else None
@@ -523,6 +743,9 @@ def run_model(params: Dict[str, Any]) -> Dict[str, Any]:
     total_dev = sum(r["dev_cost"] for r in project)
     total_org_promo = sum(r["organic_promo_revenue"] for r in project)
     total_ads_promo = sum(r["ads_promo_revenue"] for r in project)
+    total_onsite = sum(r.get("onsite_ad_revenue", 0.0) for r in project)
+    total_cards = sum(r.get("card_revenue", 0.0) for r in project)
+    year_index = min(11, len(project) - 1)
 
     kpis = {
         "scenario": params.get("scenario", SCENARIO_BASE),
@@ -543,8 +766,12 @@ def run_model(params: Dict[str, Any]) -> Dict[str, Any]:
         "total_dev_cost": total_dev,
         "total_organic_promo": total_org_promo,
         "total_ads_promo": total_ads_promo,
+        "total_onsite_ads": total_onsite,
+        "total_card_revenue": total_cards,
         "final_cumulative_cf": project[-1]["cumulative_cf"],
         "final_cumulative_incremental": project[-1]["cumulative_incremental"],
+        "year_incremental": project[year_index]["cumulative_incremental"],
+        "max_need": abs(min_cum_inc),
         "payback_project_month": payback_project,
         "payback_incremental_month": payback_incremental,
         "rnd_investment": rnd_investment,
@@ -579,6 +806,7 @@ def sensitivity_table(params: Dict[str, Any], deltas: Tuple[float, ...] = (-0.2,
         drivers.extend([
             ("seo_dip_floor_pct", "SEO-пол после переезда"),
             ("seo_recovery_months", "Срок восстановления SEO, мес."),
+            ("seo_final_pct", "SEO после восстановления"),
         ])
     if _is_stretch(params) and _enabled(params, "ads_enabled", False):
         drivers.extend([
@@ -586,6 +814,15 @@ def sensitivity_table(params: Dict[str, Any], deltas: Tuple[float, ...] = (-0.2,
             ("conversion_pct_ads", "Конверсия рекламы"),
             ("paid_partner_share_pct_ads", "Доля оплачиваемых (реклама)"),
             ("ads_cost_month", "Бюджет рекламы / мес"),
+        ])
+    if _is_stretch(params) and _enabled(params, "tid_enabled", False):
+        drivers.append(("tid_auth_share_pct", "T-ID: доля авторизованных"))
+    if _is_stretch(params) and _enabled(params, "onsite_ads_enabled", False):
+        drivers.append(("onsite_ad_ecpm", "Onsite eCPM"))
+    if _is_stretch(params) and _enabled(params, "bank_enabled", False):
+        drivers.extend([
+            ("debit_show_pct", "Black: показ"),
+            ("credit_show_pct", "Platinum: показ"),
         ])
     out: Dict[str, List[Dict]] = {}
     for key, label in drivers:
@@ -604,3 +841,58 @@ def sensitivity_table(params: Dict[str, Any], deltas: Tuple[float, ...] = (-0.2,
             })
         out[key] = rows
     return out
+
+
+def apply_base_constraints(params: Dict[str, Any]) -> Dict[str, Any]:
+    next_params = deepcopy(params)
+    next_params["scenario"] = SCENARIO_BASE
+    next_params["team_schedule"] = []
+    next_params["extra_rnd"] = []
+    next_params["ads_enabled"] = False
+    next_params["ads_traffic_month"] = 0
+    next_params["ads_cost_month"] = 0
+    next_params["team_headcount_rnd"] = 0
+    next_params["team_headcount_ops"] = 0
+    next_params["salaries_rnd"] = 0
+    next_params["salaries_ops"] = 0
+    next_params["own_traffic_lift_pct"] = 0.0
+    next_params["own_conversion_lift_pct"] = 0.0
+    next_params["own_approved_share_lift_pct"] = 0.0
+    next_params["own_paid_share_lift_pct"] = 0.0
+    next_params["own_arpu_lift_pct"] = 0.0
+    next_params["tid_enabled"] = False
+    next_params["tid_auth_share_pct"] = 0.0
+    next_params["tid_repeat_lift_pct"] = 0.0
+    next_params["tid_cpa_lift_pct"] = 0.0
+    next_params["tid_card_lift_pct"] = 0.0
+    next_params["onsite_ads_enabled"] = False
+    next_params["onsite_ad_impressions"] = 0.0
+    next_params["onsite_ad_fill_pct"] = 0.0
+    next_params["onsite_ad_ecpm"] = 0.0
+    next_params["bank_enabled"] = False
+    next_params["debit_show_pct"] = 0.0
+    next_params["debit_util_pct"] = 0.0
+    next_params["debit_inc_pct"] = 0.0
+    next_params["credit_show_pct"] = 0.0
+    next_params["credit_util_pct"] = 0.0
+    next_params["credit_inc_pct"] = 0.0
+    next_params["stretch_extra_traffic"] = 0.0
+    next_params["distribution_cost"] = 0.0
+    next_params["coverage_start_pct"] = 100.0
+    next_params["coverage_target_pct"] = 100.0
+    next_params["mon_start_pct"] = 100.0
+    next_params["mon_target_pct"] = 100.0
+    return next_params
+
+
+def apply_pess_constraints(params: Dict[str, Any]) -> Dict[str, Any]:
+    next_params = apply_base_constraints(params)
+    next_params["scenario"] = SCENARIO_PESS
+    return next_params
+
+
+def apply_pess_haircut(params: Dict[str, Any]) -> Dict[str, Any]:
+    next_params = apply_pess_constraints(params)
+    next_params.update(PESS_HAIRCUT)
+    next_params["dev_cost_month"] = next_params["dev_cost_rnd"]
+    return next_params

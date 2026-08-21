@@ -2,9 +2,9 @@
 
 Интерактивная финансовая модель. Открывается в браузере сразу, без установки Python.
 
-**Ссылка (без кэша):** https://anton6478231.github.io/fem-promokod/start.html?v=20260820-logic
+**Ссылка (без кэша):** https://anton6478231.github.io/fem-promokod/start.html?v=20260821-sync
 
-Расчёт тот же, что в локальном Streamlit: Base vs Stretch, SEO-просадка, инкремент к подрядчику.
+Расчёт тот же, что в локальном Streamlit: Base vs Stretch vs Pess, SEO-просадка, инкремент к подрядчику, T-ID / onsite eCPM / банк в Stretch.
 
 ## Локальный запуск Streamlit
 
